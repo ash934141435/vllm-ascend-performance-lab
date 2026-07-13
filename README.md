@@ -6,11 +6,29 @@
 
 生产 Baseline 是 `max-num-seqs=16`、`max-num-batched-tokens=8192`。这批数据里最明显的问题不是 KV cache 不够，而是 `max-num-seqs` 小于实际并发，很多请求只能排队。
 
+## 实验环境
+
+这些信息来自测试初始化时保存的环境快照。公开版本已经去掉服务器地址、主机名、内部路径和容器名称。
+
+| 类别 | 配置 |
+|---|---|
+| NPU | 8 × Ascend 910B4-1，单卡 64 GiB HBM |
+| 基准服务并行度 | Tensor Parallel = 4 |
+| CPU | 192 核 Kunpeng 920 |
+| 内存 | 1 TiB |
+| OS | openEuler 22.03 LTS，aarch64 |
+| Ascend Driver / Firmware | 26.0.rc1 |
+| CANN | 9.0.0 |
+| Python | 3.12.13 |
+| vLLM | 0.21.0 |
+| vLLM-Ascend | 0.21.0rc1 |
+| Docker | 27.0.1 |
+| Docker image | `sha256:d01163b6517362feba9d4896358952b4c28a4eaf529c98a0d8e95e4c0f2044b7` |
+| Model | Qwen3.6 27B |
+
 ## 实验系统架构
 
 [![vLLM-Ascend benchmark 架构图](docs/architecture.svg)](docs/architecture.drawio)
-
-点击架构图可以打开 draw.io 源文件继续编辑。
 
 仓库中各部分的分工如下：
 
@@ -143,42 +161,3 @@ bash tests/test_bench_matrix.sh
 - [90 行中位数汇总](results/summary_median.csv)
 - [270 条脱敏 canonical 结果](results/valid_results.csv)
 - [可视化图表](results/figures/)
-
-## 实验环境
-
-这些信息来自测试初始化时保存的环境快照。公开版本已经去掉服务器地址、主机名、内部路径和容器名称。
-
-| 类别 | 配置 |
-|---|---|
-| NPU | 8 × Ascend 910B4-1，单卡 64 GiB HBM |
-| 基准服务并行度 | Tensor Parallel = 4 |
-| CPU | 192 核 Kunpeng 920 |
-| 内存 | 1 TiB |
-| OS | openEuler 22.03 LTS，aarch64 |
-| Ascend Driver / Firmware | 26.0.rc1 |
-| CANN | 9.0.0 |
-| Python | 3.12.13 |
-| vLLM | 0.21.0 |
-| vLLM-Ascend | 0.21.0rc1 |
-| Docker | 27.0.1 |
-| Docker image | `sha256:d01163b6517362feba9d4896358952b4c28a4eaf529c98a0d8e95e4c0f2044b7` |
-| Model | Qwen3.6 27B |
-
-## 异常判定
-
-每次测试都会检查请求是否完整、输入输出长度是否符合预期，以及服务有没有报错、重启或 OOM。KV cache、抢占、等待队列、计数器、指标采样和预热状态也会一起检查。
-
-请求失败、OOM、服务重启和等待停滞属于硬失败。KV cache 使用率超过 85% 只记容量告警，preemption 记为性能退化或容量告警；它们本身不会让结果失效。
-
-当 `P99 TTFT > 3 × mean TTFT` 时，脚本会记录 `tail_latency_warning` 并立即热复测，但不会仅凭这一项排除结果。这里的 `valid` 只表示测试完整且没有硬失败，不等于满足生产延迟 SLO。
-
-## 局限性
-
-- 使用随机输入，没有覆盖真实业务提示词分布。
-- 输入和输出长度固定，没有测试混合长度流量。
-- `request-rate=inf` 模拟突发请求，不代表稳定到达流量。
-- 强制输出 1024 tokens，不代表真实对话的回复长度。
-- 每个场景仅重复三次，适合参数筛选，不足以替代长期稳定性测试。
-- 当前结果来自单台机器，不能直接外推至其他硬件和软件版本。
-- 原始环境快照没有记录 PyTorch、torch-npu 和模型 revision，后续复测应补采这三项。
-- 公开归档不包含完整环境快照、服务日志和原始指标采样，因此可以复算汇总，但暂时不能完全独立验证原始测量。
