@@ -9,22 +9,30 @@
 ## 实验系统架构
 
 ```mermaid
-flowchart LR
-    A["init<br/>采集软硬件环境"] --> B["group<br/>生成服务配置"]
-    B --> C["重启 vLLM 服务"]
-    C --> D["定形预热"]
-    D --> E["执行并发测试"]
-    E --> F["每秒采集运行指标"]
-    F --> G{"结果校验"}
-    G -->|通过| H["Canonical Result"]
-    G -->|尾延迟告警| I["热复测与确认"]
-    G -->|可重试异常| J["自动重试"]
-    G -->|硬失败| K["停止当前测试组"]
-    I --> H
-    J --> G
-    H --> L["Group Review"]
-    L --> M["summarize"]
-    M --> N["CSV / XLSX / Markdown / Charts"]
+flowchart TB
+    subgraph S1["准备"]
+        direction LR
+        A["init<br/>采集软硬件环境"] --> B["生成服务配置"] --> C["重启 vLLM"] --> D["定形预热"]
+    end
+
+    subgraph S2["测试与校验"]
+        direction LR
+        E["执行并发测试"] --> F["采集运行指标"] --> G{"结果校验"}
+        G -->|通过| H["Canonical Result"]
+        G -->|告警| I["热复测"]
+        G -->|可重试异常| J["自动重试"]
+        G -->|硬失败| K["停止测试组"]
+        I --> H
+        J --> G
+    end
+
+    subgraph S3["汇总"]
+        direction LR
+        L["Group Review"] --> M["summarize"] --> N["CSV / XLSX / Markdown / Charts"]
+    end
+
+    D --> E
+    H --> L
 ```
 
 仓库中各部分的分工如下：
