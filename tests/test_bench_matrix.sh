@@ -28,8 +28,15 @@ grep -F "WARNING: samples file missing" "$script"
 grep -F 'if [[ "$validation_rc" -eq 0 || "$validation_rc" -eq 11 ]]; then' "$script"
 grep -F "11)" "$script"
 grep -F "confirmation attempt" "$script"
-grep -F 'DEFAULT_CONCURRENCIES="1 5 10 16 32"' "$script"
+grep -F 'EXPERIMENT_CONFIG="${EXPERIMENT_CONFIG:-$SCRIPT_DIR/../configs/experiment.yaml}"' "$script"
+grep -F 'config-shell --config "$EXPERIMENT_CONFIG"' "$script"
 grep -F 'CONCURRENCIES="${BENCH_CONCURRENCIES:-$DEFAULT_CONCURRENCIES}"' "$script"
+grep -F 'MODEL_ID="$MODEL"' "$script"
+grep -F 'for repeat in $REPEAT_IDS' "$script"
+
+if grep -Fq 'Qwen3.6-27B' "$script"; then
+  exit 1
+fi
 
 if grep -Fq "docker top" "$script"; then
   exit 1

@@ -7,18 +7,11 @@ COMPOSE_FILE="${COMPOSE_FILE:-$SERVICE_DIR/docker-compose.yaml}"
 CONTAINER_NAME="${CONTAINER_NAME:-vllm}"
 COMPOSE_SERVICE="${COMPOSE_SERVICE:-vllm}"
 BASE_URL="${BASE_URL:-http://127.0.0.1:8010}"
-MODEL="${MODEL:-Qwen3.6-27B}"
 TOKENIZER="${TOKENIZER:-/model}"
 PYTHON_BIN="${BENCH_PYTHON:-$SERVICE_DIR/.bench-venv/bin/python3}"
 REPORT_SCRIPT="${REPORT_SCRIPT:-$SCRIPT_DIR/bench_report.py}"
 ORIGINAL_START="${ORIGINAL_START:-$SERVICE_DIR/start-vllm.sh}"
-
-VALID_SEQS="16 24 32"
-VALID_BT="8192 12288 16384"
-INPUT_LENGTHS="1024 4096"
-DEFAULT_CONCURRENCIES="1 5 10 16 32"
-CONCURRENCIES="${BENCH_CONCURRENCIES:-$DEFAULT_CONCURRENCIES}"
-OUTPUT_LEN=1024
+EXPERIMENT_CONFIG="${EXPERIMENT_CONFIG:-$SCRIPT_DIR/../configs/experiment.yaml}"
 
 SAMPLER_PID=""
 SERVE_LOG_PID=""
@@ -53,6 +46,14 @@ require_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "missing command: $1"
 }
 
+load_experiment_config() {
+  [[ -x "$PYTHON_BIN" ]] || die "missing benchmark Python: $PYTHON_BIN"
+  [[ -f "$EXPERIMENT_CONFIG" ]] || die "missing experiment config: $EXPERIMENT_CONFIG"
+  export EXPERIMENT_CONFIG
+  eval "$("$PYTHON_BIN" "$REPORT_SCRIPT" config-shell --config "$EXPERIMENT_CONFIG")"
+  CONCURRENCIES="${BENCH_CONCURRENCIES:-$DEFAULT_CONCURRENCIES}"
+}
+
 cleanup() {
   if [[ -n "$SAMPLER_PID" ]]; then
     kill "$SAMPLER_PID" 2>/dev/null || true
@@ -80,6 +81,7 @@ collect_command() {
 }
 
 init_run() {
+  load_experiment_config
   require_cmd docker
   require_cmd docker-compose
   require_cmd curl
@@ -88,8 +90,7 @@ init_run() {
   require_cmd npu-smi
   require_cmd lscpu
   require_cmd free
-  [[ -x "$PYTHON_BIN" ]] || die "missing benchmark Python: $PYTHON_BIN"
-  "$PYTHON_BIN" -c 'import openpyxl' || die "openpyxl missing; install it in $PYTHON_BIN environment"
+  "$PYTHON_BIN" -c 'import openpyxl, yaml' || die "openpyxl or PyYAML missing in $PYTHON_BIN environment"
   [[ -f "$ORIGINAL_START" ]] || die "missing $ORIGINAL_START"
   [[ -f "$COMPOSE_FILE" ]] || die "missing $COMPOSE_FILE"
   docker inspect "$CONTAINER_NAME" >/dev/null || die "missing container $CONTAINER_NAME"
@@ -102,6 +103,8 @@ init_run() {
   sha256sum "$ORIGINAL_START" >"$run_dir/env/start-vllm.original.sha256"
   cp -p "$SCRIPT_DIR/bench_matrix.sh" "$run_dir/scripts/"
   cp -p "$REPORT_SCRIPT" "$run_dir/scripts/"
+  cp -p "$EXPERIMENT_CONFIG" "$run_dir/env/experiment.yaml"
+  sha256sum "$EXPERIMENT_CONFIG" >"$run_dir/env/experiment.sha256"
 
   date -Iseconds >"$run_dir/env/collected_at.txt"
   hostname >"$run_dir/env/hostname.txt"
@@ -165,8 +168,8 @@ EOF
 wait_ready() {
   local deadline=$((SECONDS + 1200))
   while (( SECONDS < deadline )); do
-    if curl -fsS --max-time 5 "$BASE_URL/v1/models" | "$PYTHON_BIN" -c \
-      'import json,sys; d=json.load(sys.stdin); raise SystemExit(0 if any(x.get("id")=="Qwen3.6-27B" for x in d.get("data",[])) else 1)'
+    if curl -fsS --max-time 5 "$BASE_URL/v1/models" | MODEL_ID="$MODEL" "$PYTHON_BIN" -c \
+      'import json,os,sys; d=json.load(sys.stdin); target=os.environ["MODEL_ID"]; raise SystemExit(0 if any(x.get("id")==target for x in d.get("data",[])) else 1)'
     then
       return 0
     fi
@@ -406,7 +409,8 @@ run_attempt() {
     log "missing result JSON for $attempt_id"
     "$PYTHON_BIN" - "$attempt_summary" "$case_id" "$attempt_id" \
       "$attempt_number" "$serve_log" "$samples_gz" "$seq" "$bt" \
-      "$input_len" "$OUTPUT_LEN" "$concurrency" "$repeat" <<'PY'
+      "$input_len" "$OUTPUT_LEN" "$concurrency" "$repeat" \
+      "$EXPERIMENT_CONFIG_SHA256" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -424,8 +428,10 @@ from pathlib import Path
     output_len,
     concurrency,
     repeat_id,
+    config_sha256,
 ) = sys.argv[1:]
 payload = {
+    "experiment_config_sha256": config_sha256,
     "case_id": case_id,
     "attempt_id": attempt_id,
     "attempt_number": int(attempt_number),
@@ -550,14 +556,14 @@ run_case() {
       11)
         warning_hits=$((warning_hits + 1))
         if [[ "$warning_hits" -eq 1 ]]; then
-          log "tail latency warning in $case_id; immediate hot rerun"
+          log "performance or capacity warning in $case_id; immediate hot rerun"
           continue
         fi
         if [[ "$warning_hits" -eq 2 ]]; then
-          log "repeated tail latency warning in $case_id; one confirmation attempt"
+          log "repeated warning in $case_id; one confirmation attempt"
           continue
         fi
-        log "tail latency warning persisted in $case_id; retain and continue group"
+        log "warning persisted in $case_id; retain and continue group"
         CASE_RC=0
         return 0
         ;;
@@ -570,6 +576,7 @@ run_case() {
 }
 
 run_group() {
+  load_experiment_config
   local run_dir="$1"
   local seq="$2"
   local bt="$3"
@@ -585,7 +592,7 @@ run_group() {
   for input_len in $INPUT_LENGTHS; do
     for concurrency in $CONCURRENCIES; do
       run_warmup "$run_dir" "$seq" "$bt" "$input_len" "$concurrency"
-      for repeat in 1 2 3; do
+      for repeat in $REPEAT_IDS; do
         run_case "$run_dir" "$seq" "$bt" "$input_len" "$concurrency" "$repeat"
         if [[ "$CASE_RC" -ne 0 ]]; then
           "$PYTHON_BIN" "$REPORT_SCRIPT" group-review --run-dir "$run_dir" --seq "$seq" --bt "$bt" || true
@@ -602,6 +609,7 @@ run_group() {
 }
 
 summarize_run() {
+  load_experiment_config
   local run_dir="$1"
   [[ -d "$run_dir" ]] || die "missing run directory: $run_dir"
   "$PYTHON_BIN" "$REPORT_SCRIPT" summarize --run-dir "$run_dir"

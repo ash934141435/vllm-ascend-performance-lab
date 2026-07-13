@@ -9,6 +9,8 @@ from pathlib import Path
 
 from scripts.bench_report import (
     CASE_RE,
+    EXPERIMENT,
+    EXPERIMENT_CONFIG_SHA256,
     EXIT_HARD,
     EXIT_WARNING,
     RAW_FIELDS,
@@ -111,6 +113,7 @@ def attempt_row(
     decode_mean_ms: float = 6.0,
 ) -> dict:
     row = {
+        "experiment_config_sha256": EXPERIMENT_CONFIG_SHA256,
         **parse_case_id(case_id),
         "num_prompts": 5,
         "output_throughput_tok_s": output_throughput_tok_s,
@@ -151,6 +154,11 @@ def attempt_row(
 
 
 class ParseTests(unittest.TestCase):
+    def test_experiment_config_is_the_matrix_source(self):
+        self.assertEqual(EXPERIMENT["model"], "Qwen3.6-27B")
+        self.assertEqual(EXPERIMENT["max_num_seqs"], [16, 24, 32])
+        self.assertEqual(len(EXPERIMENT_CONFIG_SHA256), 64)
+
     def test_parse_case_id(self):
         case = parse_case_id("seq16_bt8192_in1024_out1024_c1_r3")
         self.assertEqual(
@@ -280,6 +288,34 @@ exec vllm serve /model \\
         self.assertEqual(reasons, [])
         self.assertEqual(row["warning_reasons"], ["tail_latency_warning"])
 
+    def test_capacity_pressure_stays_valid_with_warnings(self):
+        after = parse_prometheus(
+            AFTER.replace(
+                'vllm:num_preemptions_total{engine="0",model_name="Qwen3.6-27B"} 0',
+                'vllm:num_preemptions_total{engine="0",model_name="Qwen3.6-27B"} 1',
+            )
+        )
+        context = AttemptContext(
+            case_id="seq16_bt8192_in1024_out1024_c1_r1",
+            result=result_json(),
+            before=parse_prometheus(BEFORE),
+            after=after,
+            samples=[Sample(1000, 1, 0, 0.9, 2000)],
+            bench_rc=0,
+            restart_count_before=0,
+            restart_count_after=0,
+            started_at_before="same",
+            started_at_after="same",
+            oom_killed=False,
+            serve_log="",
+        )
+        row, status, reasons = evaluate_attempt(context)
+        self.assertEqual(status, "valid")
+        self.assertEqual(reasons, [])
+        self.assertEqual(
+            row["warning_reasons"], ["kv_over_85_pct", "preemption_warning"]
+        )
+
     def test_warmup_miss_stays_retryable(self):
         result = result_json(ttfts=[13.541, 0.545, 0.482, 0.486, 0.474])
         context = AttemptContext(
@@ -375,7 +411,7 @@ exec vllm serve /model \\
         subcommands = parser._subparsers._group_actions[0].choices
         self.assertEqual(
             set(subcommands),
-            {"render-start", "attempt", "group-review", "summarize"},
+            {"config-shell", "render-start", "attempt", "group-review", "summarize"},
         )
         self.assertNotIn("restore", subcommands)
 

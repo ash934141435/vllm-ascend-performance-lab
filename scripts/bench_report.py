@@ -5,14 +5,19 @@ import argparse
 import csv
 import difflib
 import gzip
+import hashlib
 import json
 import math
+import os
 import re
+import shlex
 import statistics
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Optional
+
+import yaml
 
 EXIT_VALID = 0
 EXIT_RETRYABLE = 10
@@ -34,11 +39,34 @@ METRIC_RE = re.compile(
     r"(?P<value>[-+0-9.eE]+)$"
 )
 
-VALID_SEQS = {16, 24, 32}
-VALID_BT = {8192, 12288, 16384}
-VALID_INPUT_LENS = (1024, 4096)
-VALID_CONCURRENCIES = (1, 5, 10, 16, 32)
-REPEATS = (1, 2, 3)
+DEFAULT_CONFIG = Path(__file__).resolve().parents[1] / "configs" / "experiment.yaml"
+EXPERIMENT_CONFIG = Path(os.environ.get("EXPERIMENT_CONFIG", DEFAULT_CONFIG))
+
+
+def load_experiment_config(path: Path) -> tuple[dict, str]:
+    raw = path.read_bytes()
+    config = yaml.safe_load(raw)
+    required = {
+        "model",
+        "max_num_seqs",
+        "max_num_batched_tokens",
+        "input_lengths",
+        "output_length",
+        "concurrencies",
+        "repeats",
+    }
+    if not isinstance(config, dict) or required - config.keys():
+        raise ValueError(f"invalid experiment config: {path}")
+    return config, hashlib.sha256(raw).hexdigest()
+
+
+EXPERIMENT, EXPERIMENT_CONFIG_SHA256 = load_experiment_config(EXPERIMENT_CONFIG)
+VALID_SEQS = set(EXPERIMENT["max_num_seqs"])
+VALID_BT = set(EXPERIMENT["max_num_batched_tokens"])
+VALID_INPUT_LENS = tuple(EXPERIMENT["input_lengths"])
+VALID_CONCURRENCIES = tuple(EXPERIMENT["concurrencies"])
+OUTPUT_LEN = int(EXPERIMENT["output_length"])
+REPEATS = tuple(range(1, int(EXPERIMENT["repeats"]) + 1))
 EXPECTED_GROUP_RESULTS = len(VALID_INPUT_LENS) * len(VALID_CONCURRENCIES) * len(REPEATS)
 EXPECTED_VALID_RESULTS = len(VALID_SEQS) * len(VALID_BT) * EXPECTED_GROUP_RESULTS
 EXPECTED_MEDIAN_ROWS = (
@@ -48,6 +76,7 @@ SEQ_RE = re.compile(r"(--max-num-seqs\s+)(\d+)")
 BT_RE = re.compile(r"(--max-num-batched-tokens\s+)(\d+)")
 
 RAW_FIELDS = [
+    "experiment_config_sha256",
     "max_num_seqs",
     "max_num_batched_tokens",
     "input_len",
@@ -354,9 +383,9 @@ def evaluate_attempt(context: AttemptContext) -> tuple[dict[str, object], str, l
     if context.oom_killed or OOM_RE.search(context.serve_log):
         hard.append("oom")
     if preemptions > 0:
-        hard.append("preemption")
+        warnings.append("preemption_warning")
     if context.samples and max(sample.kv_usage for sample in context.samples) > 0.85:
-        hard.append("kv_over_85_pct")
+        warnings.append("kv_over_85_pct")
     if stalled_waiting(context.samples):
         hard.append("waiting_stall")
     if any(value < 0 for value in (request_delta, prompt_delta, generation_delta)):
@@ -385,6 +414,7 @@ def evaluate_attempt(context: AttemptContext) -> tuple[dict[str, object], str, l
     reasons = hard if hard else sorted(set(retryable))
 
     row: dict[str, object] = {
+        "experiment_config_sha256": EXPERIMENT_CONFIG_SHA256,
         **case,
         "num_prompts": expected_prompts,
         "output_throughput_tok_s": result.get("output_throughput"),
@@ -519,7 +549,7 @@ def group_anomalies(rows: list[dict[str, object]]) -> list[dict[str, object]]:
         grouped.setdefault(key, []).append(row)
 
     for key, repeats in grouped.items():
-        if len(repeats) != 3:
+        if len(repeats) != len(REPEATS):
             continue
         for metric in DISPERSION_METRICS:
             values = [float(row[metric]) for row in repeats]
@@ -597,6 +627,10 @@ def median_rows(rows: list[dict]) -> list[dict]:
     output = []
     for key, repeats in sorted(grouped.items()):
         summary = dict(zip(GROUP_KEYS, key))
+        hashes = {row.get("experiment_config_sha256") for row in repeats}
+        if len(hashes) != 1:
+            raise ValueError(f"mixed experiment config hashes for {key}")
+        summary["experiment_config_sha256"] = hashes.pop()
         for field_name in RAW_FIELDS:
             values = [row.get(field_name) for row in repeats if isinstance(row.get(field_name), (int, float))]
             if values and field_name not in GROUP_KEYS + ["repeat_id"]:
@@ -634,7 +668,7 @@ def recommendation_table(summary: list[dict]) -> list[dict]:
     eligible = [
         row
         for row in summary
-        if row.get("repeat_count") == 3
+        if row.get("repeat_count") == len(REPEATS)
         and numeric_or(row.get("preemptions")) == 0
         and numeric_or(row.get("kv_peak_pct")) <= 85
         and numeric_or(row.get("failed_requests")) == 0
@@ -712,14 +746,14 @@ def write_xlsx(
 
 
 def choose_best(summary: list[dict], field: str, reverse: bool) -> Optional[dict]:
-    candidates = [row for row in summary if row.get("repeat_count") == 3]
+    candidates = [row for row in summary if row.get("repeat_count") == len(REPEATS)]
     if not candidates:
         return None
     return sorted(candidates, key=lambda row: float(row[field]), reverse=reverse)[0]
 
 
 def choose_stable_p99(summary: list[dict]) -> Optional[dict]:
-    candidates = [row for row in summary if row.get("repeat_count") == 3]
+    candidates = [row for row in summary if row.get("repeat_count") == len(REPEATS)]
     if not candidates:
         return None
     return min(
@@ -738,11 +772,11 @@ def write_report(path: Path, all_attempts: list[dict], median: list[dict], recom
     ttft = choose_best(median, "mean_ttft_ms", False)
     p99 = choose_stable_p99(median)
     by_input = {}
-    for input_len in (1024, 4096):
+    for input_len in VALID_INPUT_LENS:
         subset = [row for row in median if int(row["input_len"]) == input_len]
         by_input[input_len] = recommendation_table(subset)
     lines = [
-        "# Qwen3.6 27B vLLM-Ascend Benchmark Report",
+        f"# {EXPERIMENT['model']} vLLM-Ascend Benchmark Report",
         "",
         f"- All attempts: {len(all_attempts)}",
         f"- Warning attempts: {len(warnings)}",
@@ -761,8 +795,11 @@ def write_report(path: Path, all_attempts: list[dict], median: list[dict], recom
         "",
         "## Recommendations",
         "",
-        f"- 1K/1K: `{json.dumps(by_input[1024][:3], ensure_ascii=False)}`",
-        f"- 4K/1K: `{json.dumps(by_input[4096][:3], ensure_ascii=False)}`",
+        *(
+            f"- Input {input_len}, output {OUTPUT_LEN}: "
+            f"`{json.dumps(by_input[input_len][:3], ensure_ascii=False)}`"
+            for input_len in VALID_INPUT_LENS
+        ),
         f"- Overall: `{json.dumps(recommendations[:3], ensure_ascii=False)}`",
         "",
         "## Queue, KV, preemption, prefill, and decode checks",
@@ -864,6 +901,23 @@ def command_render_start(args: argparse.Namespace) -> int:
     dest_path.write_text(rendered)
     dest_path.chmod(0o755)
     diff_path.write_text(diff_text)
+    return EXIT_VALID
+
+
+def command_config_shell(args: argparse.Namespace) -> int:
+    config, digest = load_experiment_config(Path(args.config))
+    values = {
+        "MODEL": config["model"],
+        "VALID_SEQS": " ".join(map(str, config["max_num_seqs"])),
+        "VALID_BT": " ".join(map(str, config["max_num_batched_tokens"])),
+        "INPUT_LENGTHS": " ".join(map(str, config["input_lengths"])),
+        "OUTPUT_LEN": config["output_length"],
+        "DEFAULT_CONCURRENCIES": " ".join(map(str, config["concurrencies"])),
+        "REPEAT_IDS": " ".join(map(str, range(1, int(config["repeats"]) + 1))),
+        "EXPERIMENT_CONFIG_SHA256": digest,
+    }
+    for key, value in values.items():
+        print(f"{key}={shlex.quote(str(value))}")
     return EXIT_VALID
 
 
@@ -1055,6 +1109,10 @@ def command_summarize(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    config = subparsers.add_parser("config-shell")
+    config.add_argument("--config", required=True)
+    config.set_defaults(func=command_config_shell)
 
     render = subparsers.add_parser("render-start")
     render.add_argument("--source", required=True)

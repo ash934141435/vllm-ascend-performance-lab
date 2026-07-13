@@ -29,6 +29,7 @@ flowchart LR
 
 核心实现：
 
+- `configs/experiment.yaml`：唯一的实验矩阵配置源；Shell 和 Python 均从这里读取参数。
 - `scripts/bench_matrix.sh`：管理初始化、服务配置、预热、测试和分组执行。
 - `scripts/bench_report.py`：解析指标、判定异常、选择 canonical 结果并生成报告。
 - `scripts/plot_results.py`：从中位数汇总生成 README 图表。
@@ -120,13 +121,16 @@ flowchart LR
 
 ## 如何复现
 
-依赖：Bash 4+、Docker、Docker Compose、Python 3.9+、`curl`、`gzip` 和 `openpyxl`。生成图表还需要 Matplotlib。
+依赖：Bash 4+、Docker、Docker Compose、Python 3.9+、`curl`、`gzip`、PyYAML 和 `openpyxl`。生成图表还需要 Matplotlib。
 
 ```bash
 # 指向现有的 vLLM Compose 服务目录
 export SERVICE_DIR=/path/to/vllm-service
 export CONTAINER_NAME=vllm
 export COMPOSE_SERVICE=vllm
+
+# 按需修改唯一的实验矩阵配置
+cat configs/experiment.yaml
 
 # 初始化测试并采集环境，命令会返回 RUN_DIR
 ./scripts/bench_matrix.sh init
@@ -150,6 +154,7 @@ bash tests/test_bench_matrix.sh
 
 结果入口：
 
+- [实验矩阵配置](configs/experiment.yaml)；每条结果均保存该文件的 SHA256，防止混合不同配置的结果。
 - [90 行中位数汇总](results/summary_median.csv)
 - [270 条脱敏 canonical 结果](results/valid_results.csv)
 - [可视化图表](results/figures/)
@@ -177,6 +182,8 @@ bash tests/test_bench_matrix.sh
 ## 异常判定
 
 每次测试会检查请求完整性、输入输出长度、请求错误、容器重启、OOM、KV cache 使用率、抢占、等待停滞、计数器污染、指标采样缺口和预热遗漏。
+
+请求失败、OOM、服务重启和等待停滞属于硬失败；KV cache 使用率超过 85% 记录为容量告警，发生 preemption 记录为性能退化/容量告警。这两类压力信号不会单独使结果失效。
 
 当 `P99 TTFT > 3 × mean TTFT` 时，结果会记录 `tail_latency_warning` 并触发热复测，但不会仅凭该告警自动排除结果。因此，“valid”表示测试完整且没有硬失败，不表示该配置一定满足生产延迟 SLO。
 

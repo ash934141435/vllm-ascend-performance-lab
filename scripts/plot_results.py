@@ -18,7 +18,8 @@ def load_rows():
         raise ValueError(f"expected 90 summary rows, found {len(rows)}")
     for row in rows:
         for key, value in row.items():
-            row[key] = float(value)
+            if key != "experiment_config_sha256":
+                row[key] = float(value)
     return rows
 
 
