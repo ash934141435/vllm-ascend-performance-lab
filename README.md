@@ -33,7 +33,7 @@ flowchart LR
 - `scripts/bench_report.py`：解析指标、判定异常、选择 canonical 结果并生成报告。
 - `scripts/plot_results.py`：从中位数汇总生成 README 图表。
 - `tests/`：验证参数修改、异常分类、重复结果聚合和报告结构。
-- `analysis/`：保存实验结果、分组审计和运行证据。
+- `results/`：保存脱敏后的 canonical 结果、中位数汇总和图表。
 
 ## 测试矩阵
 
@@ -151,6 +151,7 @@ bash tests/test_bench_matrix.sh
 结果入口：
 
 - [90 行中位数汇总](results/summary_median.csv)
+- [270 条脱敏 canonical 结果](results/valid_results.csv)
 - [可视化图表](results/figures/)
 
 ## 实验环境
