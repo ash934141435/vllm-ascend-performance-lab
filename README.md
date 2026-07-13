@@ -1,10 +1,10 @@
 # Qwen3.6 27B vLLM-Ascend 性能基准与高并发参数调优
 
-本项目实现了一套面向 Ascend NPU 和 vLLM 的可重复性能实验系统，用于研究 `max-num-seqs`、`max-num-batched-tokens`、输入长度和请求并发对推理吞吐、首 Token 延迟、单 Token 延迟及排队行为的影响。
+这是我在 Ascend NPU 上调优 vLLM 的实验记录，也是一套可以重复运行的 benchmark 脚本。我主要想弄清楚一件事：`max-num-seqs`、`max-num-batched-tokens`、输入长度和并发变化后，吞吐、TTFT、TPOT 与排队时间会怎么变。
 
-系统覆盖环境采集、配置生成、服务重启、定形预热、重复测试、运行指标采样、异常判定、自动复测和结果汇总。当前归档包含 9 组服务配置、90 个测试场景和 270 条 canonical 结果。
+脚本会采集运行环境，生成服务配置并重启 vLLM，完成预热后重复测试，同时记录运行指标。异常结果会自动复测，最后统一生成 CSV、XLSX、Markdown 报告和图表。目前仓库归档了 9 组服务配置、90 个测试场景和 270 条 canonical 结果。
 
-生产 Baseline 为 `max-num-seqs=16`、`max-num-batched-tokens=8192`。测试结果表明，高并发瓶颈来自 `max-num-seqs` 小于实际并发所造成的排队，而不是 KV cache 容量不足。
+生产 Baseline 是 `max-num-seqs=16`、`max-num-batched-tokens=8192`。这批数据里最明显的问题不是 KV cache 不够，而是 `max-num-seqs` 小于实际并发，很多请求只能排队。
 
 ## 实验系统架构
 
@@ -27,7 +27,7 @@ flowchart LR
     M --> N["CSV / XLSX / Markdown / Charts"]
 ```
 
-核心实现：
+仓库中各部分的分工如下：
 
 - `configs/experiment.yaml`：唯一的实验矩阵配置源；Shell 和 Python 均从这里读取参数。
 - `scripts/bench_matrix.sh`：管理初始化、服务配置、预热、测试和分组执行。
@@ -48,9 +48,9 @@ flowchart LR
 | 每个场景重复次数 | 3 |
 | 聚合方式 | 三次结果中位数 |
 
-测试采用固定长度随机输入、固定 seed、温度 0、`request-rate=inf` 和 `ignore-eos`。每个场景发送 `5 × concurrency` 个请求，主要用于比较配置和观察突发负载下的系统上限。
+为了让不同配置可以直接比较，测试使用固定长度的随机输入、固定 seed、温度 0、`request-rate=inf` 和 `ignore-eos`。每个场景发送 `5 × concurrency` 个请求。这里测的是突发负载下的系统上限，不是对真实业务流量的模拟。
 
-最终归档包括 434 次实际尝试、270 条 canonical 结果和 90 行中位数汇总；测试请求失败、抢占和被排除结果均为 0。
+整轮实验实际执行了 434 次，留下 270 条 canonical 结果，汇总后是 90 行中位数数据。请求失败、抢占和被排除结果都是 0。
 
 ## 核心结果
 
@@ -58,39 +58,39 @@ flowchart LR
 
 ![吞吐随并发变化](results/figures/throughput_by_concurrency.png)
 
-并发不超过 16 时，三种 `max-num-seqs` 的差异有限；到 32 并发后，`max-num-seqs=16` 的吞吐开始回落，而 `max-num-seqs=32` 继续扩展。
+并发不超过 16 时，三种 `max-num-seqs` 差别不大。并发升到 32 后，`max-num-seqs=16` 的吞吐开始回落，`max-num-seqs=32` 仍能继续上升。
 
 ### 2. 首 Token 延迟随并发变化
 
 ![TTFT 随并发变化](results/figures/ttft_by_concurrency.png)
 
-即使 `max-num-seqs` 已覆盖 32 并发，长输入下的 P95/P99 TTFT 仍明显增长。吞吐最优不代表尾延迟最优。
+把 `max-num-seqs` 提到 32 可以解决排队，但解决不了所有延迟问题。长输入下的 P95/P99 TTFT 仍会明显增长。
 
 ### 3. 单 Token 延迟
 
 ![TPOT 随并发变化](results/figures/tpot_by_concurrency.png)
 
-并发提升增加系统总吞吐，也会增加每个请求的生成延迟。TPOT 用于判断吞吐收益何时开始不足以抵消单请求体验下降。
+并发越高，总吞吐通常越高，但单个请求生成一个 Token 所需的时间也在增加。TPOT 可以看出这笔交换什么时候开始不划算。
 
 ### 4. 排队与调度上限
 
 ![排队与 max-num-seqs 的关系](results/figures/queue_and_waiting.png)
 
-32 并发下，`max-num-seqs` 从 16 提升到 32 后，平均排队时间大幅下降。`waiting_peak` 受瞬时突发采样影响，不适合单独作为容量指标，应结合 queue mean 和 TTFT 判断。
+32 并发下，把 `max-num-seqs` 从 16 提到 32 后，平均排队时间大幅下降。`waiting_peak` 容易受瞬时采样影响，单独看它很容易误判，需要和 queue mean、TTFT 放在一起判断。
 
 补充视图：
 
 ![吞吐与 P99 TTFT Pareto 前沿](results/figures/throughput_p99_pareto.png)
 
-## 三条主要发现
+## 我从结果里看到什么
 
-1. **`max-num-seqs` 是高并发场景的第一调优参数。** 32 并发下，将其从 16 提升到 32，跨输入长度和 batched-token 配置的平均吞吐由 `511` 提升到 `796 tok/s`，平均 P50 TTFT 由 `31.55` 秒下降到 `1.18` 秒。
-2. **增大 `max-num-batched-tokens` 不会稳定提升性能。** 三个测试值的跨场景平均吞吐分别为 `367.74`、`365.56` 和 `360.89 tok/s`。应先确定并发上限，再根据输入长度微调该参数。
-3. **吞吐最优不等于延迟最优。** 本次峰值为 `849.42 tok/s`，对应 `max-num-seqs=32`、`max-num-batched-tokens=12288`、输入 1024、并发 32；高并发长输入仍存在明显尾延迟。
+1. 高并发场景应该先调 `max-num-seqs`。32 并发下，将它从 16 提到 32，跨输入长度和 batched-token 配置的平均吞吐从 `511` 增至 `796 tok/s`，平均 P50 TTFT 从 `31.55` 秒降至 `1.18` 秒。
+2. 单纯增大 `max-num-batched-tokens` 没有带来稳定收益。三个测试值的跨场景平均吞吐分别是 `367.74`、`365.56` 和 `360.89 tok/s`。更实际的顺序是先确定并发上限，再按输入长度微调。
+3. 全矩阵的吞吐峰值是 `849.42 tok/s`，对应 `max-num-seqs=32`、`max-num-batched-tokens=12288`、输入 1024、并发 32。不过长输入、高并发时的尾延迟依然明显，峰值吞吐不是唯一目标。
 
-## Baseline → Optimization
+## 从 Baseline 到候选配置
 
-生产 Baseline 为 `seq=16, batched-tokens=8192`。对于同时覆盖 1024 和 4096 输入的服务，建议候选配置为 `seq=32, batched-tokens=16384`：它在 4096 输入下取得最高吞吐，在 1024 输入下的吞吐仅比全矩阵峰值低约 0.5%，同时避免维护两套工作负载配置。
+生产 Baseline 是 `seq=16, batched-tokens=8192`。如果一套服务需要同时处理 1024 和 4096 两种输入，我会把 `seq=32, batched-tokens=16384` 作为候选配置。它在 4096 输入下吞吐最高，在 1024 输入下也只比全矩阵峰值低约 0.5%，没有必要为两种输入分别维护配置。
 
 下表比较相同硬件、模型、输出长度和 32 并发下的三次测试中位数：
 
@@ -107,7 +107,7 @@ flowchart LR
 | 4096 | Mean TPOT | 29.46 ms | 36.83 ms | +25.0% |
 | 4096 | Queue mean | 28.56 s | 0.93 s | **-96.7%** |
 
-这项调整显著提高总吞吐并消除大部分排队，但 TPOT 上升约 17%–25%。因此它适合高并发吞吐场景；若业务更重视单请求生成速度，应限制并发，而不是只追求峰值吞吐。
+调整后的吞吐更高，排队也基本消失，代价是 TPOT 上升约 17%–25%。它更适合看重高并发吞吐的业务。如果单请求生成速度更重要，限制并发会比继续追峰值吞吐更合适。
 
 ## 工作负载选型
 
@@ -117,7 +117,7 @@ flowchart LR
 | 1024 输入、32 并发 | `seq=32, batched-tokens=12288` | 849.42 tok/s | 1.16 s |
 | 4096 输入、32 并发 | `seq=32, batched-tokens=16384` | 766.02 tok/s | 1.37 s |
 
-这些是当前实验条件下的候选配置，不代表未经业务流量验证即可直接替换生产配置。
+表里的配置只在当前实验条件下成立。上线前仍要用真实流量和业务 SLO 验证。
 
 ## 如何复现
 
@@ -161,7 +161,7 @@ bash tests/test_bench_matrix.sh
 
 ## 实验环境
 
-以下信息来自测试 run 初始化阶段保存的环境快照，公开展示时不包含服务器地址、主机名、内部路径或容器名称。
+这些信息来自测试初始化时保存的环境快照。公开版本已经去掉服务器地址、主机名、内部路径和容器名称。
 
 | 类别 | 配置 |
 |---|---|
@@ -181,11 +181,11 @@ bash tests/test_bench_matrix.sh
 
 ## 异常判定
 
-每次测试会检查请求完整性、输入输出长度、请求错误、容器重启、OOM、KV cache 使用率、抢占、等待停滞、计数器污染、指标采样缺口和预热遗漏。
+每次测试都会检查请求是否完整、输入输出长度是否符合预期，以及服务有没有报错、重启或 OOM。KV cache、抢占、等待队列、计数器、指标采样和预热状态也会一起检查。
 
-请求失败、OOM、服务重启和等待停滞属于硬失败；KV cache 使用率超过 85% 记录为容量告警，发生 preemption 记录为性能退化/容量告警。这两类压力信号不会单独使结果失效。
+请求失败、OOM、服务重启和等待停滞属于硬失败。KV cache 使用率超过 85% 只记容量告警，preemption 记为性能退化或容量告警；它们本身不会让结果失效。
 
-当 `P99 TTFT > 3 × mean TTFT` 时，结果会记录 `tail_latency_warning` 并触发热复测，但不会仅凭该告警自动排除结果。因此，“valid”表示测试完整且没有硬失败，不表示该配置一定满足生产延迟 SLO。
+当 `P99 TTFT > 3 × mean TTFT` 时，脚本会记录 `tail_latency_warning` 并立即热复测，但不会仅凭这一项排除结果。这里的 `valid` 只表示测试完整且没有硬失败，不等于满足生产延迟 SLO。
 
 ## 局限性
 
