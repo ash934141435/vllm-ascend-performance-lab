@@ -8,32 +8,9 @@
 
 ## 实验系统架构
 
-```mermaid
-flowchart TB
-    subgraph S1["准备"]
-        direction LR
-        A["init<br/>采集软硬件环境"] --> B["生成服务配置"] --> C["重启 vLLM"] --> D["定形预热"]
-    end
+[![vLLM-Ascend benchmark 架构图](docs/architecture.svg)](docs/architecture.drawio)
 
-    subgraph S2["测试与校验"]
-        direction LR
-        E["执行并发测试"] --> F["采集运行指标"] --> G{"结果校验"}
-        G -->|通过| H["Canonical Result"]
-        G -->|告警| I["热复测"]
-        G -->|可重试异常| J["自动重试"]
-        G -->|硬失败| K["停止测试组"]
-        I --> H
-        J --> G
-    end
-
-    subgraph S3["汇总"]
-        direction LR
-        L["Group Review"] --> M["summarize"] --> N["CSV / XLSX / Markdown / Charts"]
-    end
-
-    D --> E
-    H --> L
-```
+点击架构图可以打开 draw.io 源文件继续编辑。
 
 仓库中各部分的分工如下：
 
