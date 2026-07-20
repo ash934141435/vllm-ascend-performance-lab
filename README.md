@@ -1,6 +1,12 @@
-# Qwen3.6 27B vLLM-Ascend 性能基准与高并发参数调优
+# Qwen3.6-27B vLLM-Ascend Serving 与执行机制性能优化
 
-这是我在 Ascend NPU 上调优 vLLM 的实验记录，也是一套可以重复运行的 benchmark 脚本。我主要想弄清楚一件事：`max-num-seqs`、`max-num-batched-tokens`、输入长度和并发变化后，吞吐、TTFT、TPOT 与排队时间会怎么变。
+> 本项目分两个阶段：
+> - **阶段一（已完成）**：高并发 Serving 参数调优 —— `max-num-seqs` / `max-num-batched-tokens` 扫描，得到 `32/16384` 候选配置。
+> - **阶段二（已完成）**：在固定 `32/16384` 基线上完成执行机制消融与 CPU/NPU Profiler；最终保留 async、MTP=3 和 `FULL_DECODE_ONLY`。
+>
+> 完整计划见 [`PROJECT_PLAN.md`](PROJECT_PLAN.md)。
+
+这是我在 Ascend NPU 上调优 vLLM 的实验记录，也是一套可以重复运行的 benchmark 脚本。阶段一主要回答：`max-num-seqs`、`max-num-batched-tokens`、输入长度和并发变化后，吞吐、TTFT、TPOT 与排队时间会怎么变。阶段二在阶段一得到的候选配置上，进一步回答框架执行机制（异步调度、投机解码、图模式）对吞吐与延迟的贡献，以及瓶颈在哪里。
 
 脚本会采集运行环境，生成服务配置并重启 vLLM，完成预热后重复测试，同时记录运行指标。异常结果会自动复测，最后统一生成 CSV、XLSX、Markdown 报告和图表。目前仓库归档了 9 组服务配置、90 个测试场景和 270 条 canonical 结果。
 
@@ -24,7 +30,7 @@
 | vLLM-Ascend | 0.21.0rc1 |
 | Docker | 27.0.1 |
 | Docker image | `sha256:d01163b6517362feba9d4896358952b4c28a4eaf529c98a0d8e95e4c0f2044b7` |
-| Model | Qwen3.6 27B |
+| Model | Qwen3.6-27B |
 
 ## 实验系统架构
 
@@ -148,16 +154,56 @@ cat configs/experiment.yaml
 python3 scripts/plot_results.py
 ```
 
-本地验证：
-
-```bash
-python -m unittest -v tests.test_bench_report
-bash tests/test_bench_matrix.sh
-```
-
 结果入口：
 
 - [实验矩阵配置](configs/experiment.yaml)；每条结果均保存该文件的 SHA256，防止混合不同配置的结果。
 - [90 行中位数汇总](results/summary_median.csv)
 - [270 条脱敏 canonical 结果](results/valid_results.csv)
 - [可视化图表](results/figures/)
+
+## 阶段二：执行机制消融与 Profiling
+
+阶段二在固定 `32/16384` 基线上，对三类执行机制做单变量消融，覆盖两种工作负载（prefill-heavy ≈4096 tok / decode-heavy ≈1024 tok），每种配置重复 3 次，共 24 个结果。
+
+| 配置 | 变更（单变量） | 验证目标 |
+|---|---|---|
+| `BASE` | 无（async on + MTP on + FULL_DECODE_ONLY） | 对照基线 |
+| `ASYNC_OFF` | 关闭 `--async-scheduling` | 异步调度对吞吐/尾延迟贡献 |
+| `MTP_OFF` | 移除 `--speculative_config` | 投机解码接受率与净收益 |
+| `EAGER` | `cudagraph_mode=NONE` | 图模式对 decode 吞吐贡献 |
+
+实验通过 [`expected_manifest.json`](configs/expected_manifest.json) 固定软件、模型和硬件环境，每轮只改一个执行机制。各配置按 [`execution_ablation.yaml`](configs/execution_ablation.yaml) 轮换运行，避免运行先后和机器温度持续偏向某一组。结果统一按 [`analysis_rules.yaml`](configs/analysis_rules.yaml) 判断，其中阈值来自阶段一的 270 条历史结果。
+
+两类工作负载使用同一批固定 prompt，内容和精确 token 数记录在 [`prompts/manifest.json`](results/execution_ablation/prompts/manifest.json)：
+
+- `prefill_heavy`：64 条，token 最小值/中位数/最大值为 3703 / 3926 / 4327。
+- `decode_heavy`：64 条，token 最小值/中位数/最大值为 985 / 1020 / 1063。
+
+运行入口（内部执行固定使用同一台 TP=4 / NPU 0–3 服务器；公开命令只保留环境变量）：
+
+```bash
+export SERVICE_DIR=/path/to/vllm-service
+export CONTAINER_NAME=vllm
+export COMPOSE_SERVICE=vllm
+export BENCH_PYTHON=/path/to/python3
+
+# 初始化并渲染消融矩阵（输出 ABLATION_* 变量供 bench_matrix.sh 消费）
+python3 scripts/bench_report.py config-ablation --config configs/execution_ablation.yaml
+
+# 执行整轮消融：init 即触发完整循环（init → 按轮换顺序 group → 每 case 采集+判定）
+./scripts/bench_execution_ablation.sh init
+```
+
+24/24 次正式运行有效；汇总见 [`summary.csv`](results/execution_ablation/summary.csv)，逐次结果见 [`raw.csv`](results/execution_ablation/raw.csv)。
+
+| 配置 | Decode 吞吐 vs BASE | Decode TPOT vs BASE | Prefill 吞吐 vs BASE | 决策 |
+|---|---:|---:|---:|---|
+| `ASYNC_OFF` | +2.12% | -0.51% | -1.35% | 低于 5% 效应量，保留 async |
+| `MTP_OFF` | -18.64% | +21.78% | -30.05% | 回归，保留 MTP=3 |
+| `EAGER` | -63.77% | +175.08% | -67.76% | 严重回归，保留图模式 |
+
+正确性 guardrail：MTP on/off 仅 3/8 请求精确 token 一致，故不推荐 `MTP_OFF`；证据见 [`correctness.csv`](results/execution_ablation/correctness.csv)。Profiler 显示 EAGER 的 HCCL 汇总时间约为 BASE 的 17.6 倍、Host launch 次数约 2.40 倍；聚合见 [`exported_metrics.csv`](results/profiling/exported_metrics.csv)，完整解释见 [`execution_optimization.md`](docs/execution_optimization.md)。
+
+最终链路：`16/8192`（生产 baseline）→ `32/16384`（阶段一，1024/1024、C32 吞吐 +63.4%）→ 保持 async on、MTP=3、`FULL_DECODE_ONLY`（阶段二 final）。结论限于 TP=4、NPU 0–3、突发 concurrency=32；不外推低 QPS 或其他模型。
+
+> 状态：P1–P4 实验完成；49 项本地测试全绿。大型 Profiler 原始报告留在远端，仓库保存脱敏 CSV、图和 SHA256。

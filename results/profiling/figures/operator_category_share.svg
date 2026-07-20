@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="357" viewBox="0 0 960 357">
+<rect width="100%" height="100%" fill="#fff"/>
+<style>text{font-family:Arial,sans-serif;fill:#172033}.label{font-size:13px}.title{font-size:20px;font-weight:700}.value{font-size:12px}</style>
+<text x="20" y="30" class="title">NPU operator category share: BASE vs EAGER</text>
+<rect x="680" y="16" width="14" height="14" fill="#2878b5"/><text x="700" y="28" class="label">BASE</text>
+<rect x="770" y="16" width="14" height="14" fill="#d95f02"/><text x="790" y="28" class="label">EAGER</text>
+<text x="20" y="76" class="label">data_movement</text>
+<rect x="190" y="62" width="244.0" height="12" fill="#2878b5"/>
+<rect x="190" y="77" width="271.2" height="12" fill="#d95f02"/>
+<text x="444.0" y="73" class="value">34.9%</text>
+<text x="471.2" y="88" class="value">38.7%</text>
+<text x="20" y="110" class="label">other</text>
+<rect x="190" y="96" width="125.3" height="12" fill="#2878b5"/>
+<rect x="190" y="111" width="206.0" height="12" fill="#d95f02"/>
+<text x="325.3" y="107" class="value">17.9%</text>
+<text x="406.0" y="122" class="value">29.4%</text>
+<text x="20" y="144" class="label">gated_delta</text>
+<rect x="190" y="130" width="102.7" height="12" fill="#2878b5"/>
+<rect x="190" y="145" width="40.2" height="12" fill="#d95f02"/>
+<text x="302.7" y="141" class="value">14.7%</text>
+<text x="240.2" y="156" class="value">5.7%</text>
+<text x="20" y="178" class="label">matmul</text>
+<rect x="190" y="164" width="81.2" height="12" fill="#2878b5"/>
+<rect x="190" y="179" width="47.5" height="12" fill="#d95f02"/>
+<text x="281.2" y="175" class="value">11.6%</text>
+<text x="247.5" y="190" class="value">6.8%</text>
+<text x="20" y="212" class="label">norm</text>
+<rect x="190" y="198" width="64.5" height="12" fill="#2878b5"/>
+<rect x="190" y="213" width="116.9" height="12" fill="#d95f02"/>
+<text x="264.5" y="209" class="value">9.2%</text>
+<text x="316.9" y="224" class="value">16.7%</text>
+<text x="20" y="246" class="label">tp_collective_kernel</text>
+<rect x="190" y="232" width="64.3" height="12" fill="#2878b5"/>
+<rect x="190" y="247" width="0.0" height="12" fill="#d95f02"/>
+<text x="264.3" y="243" class="value">9.2%</text>
+<text x="200.0" y="258" class="value">0.0%</text>
+<text x="20" y="280" class="label">ffn_activation</text>
+<rect x="190" y="266" width="18.0" height="12" fill="#2878b5"/>
+<rect x="190" y="281" width="18.2" height="12" fill="#d95f02"/>
+<text x="218.0" y="277" class="value">2.6%</text>
+<text x="218.2" y="292" class="value">2.6%</text>
+<text x="20" y="314" class="label">attention</text>
+<rect x="190" y="300" width="0.0" height="12" fill="#2878b5"/>
+<rect x="190" y="315" width="0.0" height="12" fill="#d95f02"/>
+<text x="200.0" y="311" class="value">0.0%</text>
+<text x="200.0" y="326" class="value">0.0%</text>
+</svg>

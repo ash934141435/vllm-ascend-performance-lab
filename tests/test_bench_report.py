@@ -19,6 +19,7 @@ from scripts.bench_report import (
     command_attempt,
     command_group_review,
     command_summarize,
+    comparable_rows_for_tail,
     build_parser,
     group_anomalies,
     histogram_delta,
@@ -43,6 +44,19 @@ vllm:generation_tokens_total{engine="0",model_name="Qwen3.6-27B"} 2000
 vllm:request_success_total{engine="0",finished_reason="length",model_name="Qwen3.6-27B"} 10
 vllm:num_preemptions_total{engine="0",model_name="Qwen3.6-27B"} 0
 """
+
+
+class TestMixedAttemptSchemas(unittest.TestCase):
+    def test_tail_comparison_skips_ablation_schema(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            attempts = Path(tmp) / "summary" / "attempts"
+            attempts.mkdir(parents=True)
+            (attempts / "abl_BASE.json").write_text(json.dumps({
+                "attempt_status": "valid", "input_len": 1024,
+                "output_len": 1024, "concurrency": 32,
+            }))
+            row = {"input_len": 1024, "output_len": 1024, "concurrency": 32}
+            self.assertEqual(comparable_rows_for_tail(Path(tmp), 32, 16384, row), [])
 
 AFTER = """\
 vllm:request_queue_time_seconds_bucket{engine="0",le="0.3",model_name="Qwen3.6-27B"} 15
@@ -411,7 +425,7 @@ exec vllm serve /model \\
         subcommands = parser._subparsers._group_actions[0].choices
         self.assertEqual(
             set(subcommands),
-            {"config-shell", "render-start", "attempt", "group-review", "summarize"},
+            {"config-shell", "render-start", "config-ablation", "attempt", "attempt-ablation", "summarize-ablation", "group-review", "summarize"},
         )
         self.assertNotIn("restore", subcommands)
 

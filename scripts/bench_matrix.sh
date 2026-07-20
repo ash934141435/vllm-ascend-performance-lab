@@ -12,6 +12,8 @@ PYTHON_BIN="${BENCH_PYTHON:-$SERVICE_DIR/.bench-venv/bin/python3}"
 REPORT_SCRIPT="${REPORT_SCRIPT:-$SCRIPT_DIR/bench_report.py}"
 ORIGINAL_START="${ORIGINAL_START:-$SERVICE_DIR/start-vllm.sh}"
 EXPERIMENT_CONFIG="${EXPERIMENT_CONFIG:-$SCRIPT_DIR/../configs/experiment.yaml}"
+EXPECTED_MANIFEST="${EXPECTED_MANIFEST:-$SCRIPT_DIR/../configs/expected_manifest.json}"
+TARGET_NPU_IDS="${TARGET_NPU_IDS:-0 1 2 3}"
 
 SAMPLER_PID=""
 SERVE_LOG_PID=""
@@ -54,17 +56,24 @@ load_experiment_config() {
   CONCURRENCIES="${BENCH_CONCURRENCIES:-$DEFAULT_CONCURRENCIES}"
 }
 
+stop_background() {
+  local pid="$1" i
+  [[ -n "$pid" ]] || return 0
+  kill "$pid" 2>/dev/null || true
+  pkill -P "$pid" 2>/dev/null || true
+  for i in {1..20}; do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.1
+  done
+  kill -KILL "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+}
+
 cleanup() {
-  if [[ -n "$SAMPLER_PID" ]]; then
-    kill "$SAMPLER_PID" 2>/dev/null || true
-    wait "$SAMPLER_PID" 2>/dev/null || true
-    SAMPLER_PID=""
-  fi
-  if [[ -n "$SERVE_LOG_PID" ]]; then
-    kill "$SERVE_LOG_PID" 2>/dev/null || true
-    wait "$SERVE_LOG_PID" 2>/dev/null || true
-    SERVE_LOG_PID=""
-  fi
+  stop_background "$SAMPLER_PID"
+  stop_background "$SERVE_LOG_PID"
+  SAMPLER_PID=""
+  SERVE_LOG_PID=""
 }
 
 trap cleanup EXIT INT TERM
@@ -96,7 +105,7 @@ init_run() {
   docker inspect "$CONTAINER_NAME" >/dev/null || die "missing container $CONTAINER_NAME"
 
   local run_dir="$SERVICE_DIR/bench_runs/$(date +%Y%m%d_%H%M%S)"
-  mkdir -p "$run_dir"/{scripts,logs,results_raw/attempts,metrics,summary/attempts,env}
+  mkdir -p "$run_dir"/{scripts,configs,logs,results_raw/attempts,metrics,summary/attempts,env,profiler}
 
   cp -p "$ORIGINAL_START" "$run_dir/scripts/start-vllm.original.sh"
   cp -p "$ORIGINAL_START" "$run_dir/env/start-vllm.original.sh"
@@ -139,16 +148,23 @@ prepare_group_files() {
   local run_dir="$1"
   local seq="$2"
   local bt="$3"
-  local start_script="$run_dir/scripts/start_seq${seq}_bt${bt}.sh"
-  local diff_file="$run_dir/scripts/start_seq${seq}_bt${bt}.diff"
-  local override="$run_dir/scripts/compose_seq${seq}_bt${bt}.override.yaml"
+  local flags=""
+  [[ -n "${DISABLE_ASYNC:-}" ]] && flags="${flags}_noasync"
+  [[ -n "${DISABLE_MTP:-}" ]] && flags="${flags}_nomtp"
+  [[ -n "${EAGER:-}" ]] && flags="${flags}_eager"
+  local start_script="$run_dir/scripts/start_seq${seq}_bt${bt}${flags}.sh"
+  local diff_file="$run_dir/scripts/start_seq${seq}_bt${bt}${flags}.diff"
+  local override="$run_dir/scripts/compose_seq${seq}_bt${bt}${flags}.override.yaml"
 
   "$PYTHON_BIN" "$REPORT_SCRIPT" render-start \
     --source "$run_dir/scripts/start-vllm.original.sh" \
     --dest "$start_script" \
     --diff-out "$diff_file" \
     --seq "$seq" \
-    --bt "$bt"
+    --bt "$bt" \
+    ${DISABLE_ASYNC:+--disable-async} \
+    ${DISABLE_MTP:+--disable-mtp} \
+    ${EAGER:+--eager}
 
   cat >"$override" <<EOF
 services:
@@ -168,8 +184,8 @@ EOF
 wait_ready() {
   local deadline=$((SECONDS + 1200))
   while (( SECONDS < deadline )); do
-    if curl -fsS --max-time 5 "$BASE_URL/v1/models" | MODEL_ID="$MODEL" "$PYTHON_BIN" -c \
-      'import json,os,sys; d=json.load(sys.stdin); target=os.environ["MODEL_ID"]; raise SystemExit(0 if any(x.get("id")==target for x in d.get("data",[])) else 1)'
+    if curl -fsS --max-time 5 "$BASE_URL/v1/models" 2>/dev/null | MODEL_ID="$MODEL" "$PYTHON_BIN" -c \
+      'import json,os,sys; raw=sys.stdin.read(); d=json.loads(raw) if raw else {}; target=os.environ["MODEL_ID"]; raise SystemExit(0 if any(x.get("id")==target for x in d.get("data",[])) else 1)'
     then
       return 0
     fi
@@ -179,8 +195,8 @@ wait_ready() {
 }
 
 get_vllm_args() {
-  docker exec "$CONTAINER_NAME" sh -lc \
-    "ps -eo args 2>/dev/null | grep '[v]llm serve' | head -1"
+  docker exec "$CONTAINER_NAME" ps -eo args 2>/dev/null |
+    awk '/[v]llm serve/ && !found { line=$0; found=1 } END { if (found) print line; else exit 1 }'
 }
 
 verify_running_config() {
@@ -192,9 +208,83 @@ verify_running_config() {
   grep -F -- "--max-num-batched-tokens $bt" <<<"$args" >/dev/null \
     || die "running max-num-batched-tokens mismatch"
   local source
+  local flags=""
+  [[ -n "${DISABLE_ASYNC:-}" ]] && flags="${flags}_noasync"
+  [[ -n "${DISABLE_MTP:-}" ]] && flags="${flags}_nomtp"
+  [[ -n "${EAGER:-}" ]] && flags="${flags}_eager"
   source="$(docker inspect "$CONTAINER_NAME" \
     --format '{{range .Mounts}}{{if eq .Destination "/workspace/start.sh"}}{{.Source}}{{end}}{{end}}')"
-  [[ "$source" == *"start_seq${seq}_bt${bt}.sh" ]] || die "container start-script mount mismatch: $source"
+  [[ "$source" == *"start_seq${seq}_bt${bt}${flags}.sh" ]] || die "container start-script mount mismatch: $source"
+}
+
+verify_expected_manifest() {
+  local run_dir="$1" image config_sha visible container_pid
+  local inspect_file="$run_dir/env/docker-inspect-current.json"
+  [[ -f "$EXPECTED_MANIFEST" ]] || die "missing expected manifest: $EXPECTED_MANIFEST"
+  image="$(docker inspect "$CONTAINER_NAME" --format '{{.Image}}')"
+  config_sha="$(docker exec "$CONTAINER_NAME" sha256sum /model/config.json | awk '{print $1}')"
+  container_pid="$(docker inspect "$CONTAINER_NAME" --format '{{.State.Pid}}')"
+  visible="$(tr '\0' '\n' <"/proc/$container_pid/environ" | awk -F= '$1=="ASCEND_RT_VISIBLE_DEVICES" {sub(/^[^=]*=/, ""); value=$0} END {print value}')"
+  docker inspect "$CONTAINER_NAME" >"$inspect_file"
+  if ! "$PYTHON_BIN" - "$EXPECTED_MANIFEST" "$run_dir/manifest.json" "$image" "$config_sha" "$visible" <<'PY'
+import hashlib, json, sys
+from datetime import datetime, timezone
+
+expected_path, output, image, config_sha, visible = sys.argv[1:]
+expected = json.load(open(expected_path, encoding="utf-8"))
+actual = {
+    "image_digest": image,
+    "model_config_json_sha256": config_sha,
+    "ASCEND_RT_VISIBLE_DEVICES": visible,
+}
+wanted = {
+    "image_digest": expected["image"]["digest"],
+    "model_config_json_sha256": expected["model"]["config_json_sha256"],
+    "ASCEND_RT_VISIBLE_DEVICES": ",".join(map(str, expected["hardware"]["npu_ids"])),
+}
+mismatches = {k: {"expected": wanted[k], "actual": actual[k]} for k in wanted if actual[k] != wanted[k]}
+payload = {
+    "collected_at": datetime.now(timezone.utc).astimezone().isoformat(),
+    "expected_manifest_sha256": hashlib.sha256(open(expected_path, "rb").read()).hexdigest(),
+    "actual": actual,
+    "verified": not mismatches,
+    "mismatches": mismatches,
+}
+json.dump(payload, open(output, "w", encoding="utf-8"), indent=2)
+raise SystemExit(bool(mismatches))
+PY
+  then
+    die "manifest mismatch; see $run_dir/manifest.json"
+  fi
+}
+
+verify_ablation() {
+  local args
+  args="$(get_vllm_args)"
+  if [[ -n "${DISABLE_ASYNC:-}" ]]; then
+    grep -Fq -- '--async-scheduling' <<<"$args" \
+      && die "ASYNC_OFF requested but --async-scheduling still present"
+  else
+    grep -Fq -- '--async-scheduling' <<<"$args" \
+      || die "baseline expects --async-scheduling but it is missing"
+  fi
+  if [[ -n "${DISABLE_MTP:-}" ]]; then
+    grep -Fq -- '--speculative_config' <<<"$args" \
+      && die "MTP_OFF requested but --speculative_config still present"
+  else
+    grep -Fq -- '--speculative_config' <<<"$args" \
+      || die "baseline expects --speculative_config but it is missing"
+  fi
+  if [[ -n "${EAGER:-}" ]]; then
+    grep -Fq -- 'NONE' <<<"$args" \
+      || die "EAGER requested but cudagraph_mode NONE missing"
+    grep -Fq -- 'FULL_DECODE_ONLY' <<<"$args" \
+      && die "EAGER requested but FULL_DECODE_ONLY still present"
+  else
+    grep -Fq -- 'FULL_DECODE_ONLY' <<<"$args" \
+      || die "baseline expects FULL_DECODE_ONLY but it is missing"
+  fi
+  return 0
 }
 
 restart_group_service() {
@@ -216,6 +306,9 @@ restart_group_service() {
 
   wait_ready || die "service not ready after 20 minutes"
   verify_running_config "$seq" "$bt"
+  verify_ablation
+  verify_expected_manifest "$run_dir"
+  host_idle_guard "$run_dir" freeze
   {
     printf '### seq=%s bt=%s ts=%s\n' "$seq" "$bt" "$(date -Iseconds)"
     get_vllm_args
@@ -234,6 +327,7 @@ restart_group_service() {
 }
 
 wait_idle() {
+  local run_dir="${1:-}"
   local stable=0
   local deadline=$((SECONDS + 300))
   while (( stable < 3 && SECONDS < deadline )); do
@@ -252,6 +346,85 @@ wait_idle() {
     sleep 1
   done
   (( stable >= 3 )) || die "wait_idle timed out after 5 minutes"
+  verify_target_npu_processes
+  [[ -z "$run_dir" ]] || wait_host_idle "$run_dir"
+}
+
+wait_host_idle() {
+  local run_dir="$1" deadline=$((SECONDS + ${HOST_IDLE_WAIT_SECONDS:-300}))
+  while (( SECONDS < deadline )); do
+    host_idle_guard "$run_dir" verify 2>/dev/null && return 0
+    sleep "${HOST_IDLE_POLL_SECONDS:-15}"
+  done
+  host_idle_guard "$run_dir" verify || die "host load outside frozen idle window"
+}
+
+host_idle_guard() {
+  local run_dir="$1" mode="$2" output
+  output="$run_dir/env/host-idle.json"
+  if [[ "$mode" == freeze && -f "$output" ]]; then
+    return 0
+  fi
+  if ! "$PYTHON_BIN" - "$output" "$mode" <<'PY'
+import json, statistics, sys, time
+from pathlib import Path
+
+output, mode = Path(sys.argv[1]), sys.argv[2]
+def cpu_busy():
+    def read():
+        fields = list(map(int, Path("/proc/stat").read_text().splitlines()[0].split()[1:]))
+        return sum(fields), fields[3] + fields[4]
+    total1, idle1 = read(); time.sleep(1); total2, idle2 = read()
+    return 100 * (1 - (idle2 - idle1) / (total2 - total1))
+def sample():
+    return {"load1": float(Path("/proc/loadavg").read_text().split()[0]), "cpu_busy_pct": cpu_busy()}
+if mode == "freeze":
+    samples = [sample() for _ in range(5)]
+    load = [x["load1"] for x in samples]; cpu = [x["cpu_busy_pct"] for x in samples]
+    med_load, med_cpu = statistics.median(load), statistics.median(cpu)
+    mad_load = statistics.median(abs(x - med_load) for x in load)
+    mad_cpu = statistics.median(abs(x - med_cpu) for x in cpu)
+    payload = {"source": "preflight_idle_window", "samples": samples,
+               "thresholds": {"load1": med_load + max(1.0, 3 * mad_load),
+                              "cpu_busy_pct": med_cpu + max(5.0, 3 * mad_cpu)}}
+    output.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+else:
+    payload = json.loads(output.read_text(encoding="utf-8")); current = sample()
+    failed = [k for k, limit in payload["thresholds"].items() if current[k] > limit]
+    if failed:
+        print("host idle threshold exceeded: " + ", ".join(
+              f"{k}={current[k]:.2f}>{payload['thresholds'][k]:.2f}" for k in failed), file=sys.stderr)
+        raise SystemExit(1)
+PY
+  then
+    [[ "$mode" == freeze ]] && die "failed to freeze host idle window"
+    return 1
+  fi
+}
+
+is_container_process() {
+  local pid="$1" container_pid="$2" ppid
+  while [[ "$pid" =~ ^[0-9]+$ ]] && (( pid > 1 )); do
+    [[ "$pid" == "$container_pid" ]] && return 0
+    ppid="$(awk '/^PPid:/ {print $2}' "/proc/$pid/status" 2>/dev/null)" || return 1
+    [[ -n "$ppid" && "$ppid" != "$pid" ]] || return 1
+    pid="$ppid"
+  done
+  return 1
+}
+
+verify_target_npu_processes() {
+  local container_pid npu pid
+  container_pid="$(docker inspect "$CONTAINER_NAME" --format '{{.State.Pid}}')"
+  while read -r npu pid; do
+    contains_word "$npu" "$TARGET_NPU_IDS" || continue
+    is_container_process "$pid" "$container_pid" \
+      || die "foreign process on target NPU $npu: pid=$pid"
+  done < <(npu-smi info | awk -F'|' '
+    $2 ~ /^[[:space:]]*[0-9]+[[:space:]]*$/ {
+      gsub(/[[:space:]]/, "", $2); gsub(/[[:space:]]/, "", $4)
+      if ($4 ~ /^[0-9]+$/) print $2, $4
+    }')
 }
 
 run_warmup() {
@@ -293,7 +466,7 @@ run_warmup() {
   done
 
   [[ "$rc" -eq 0 ]] || die "warmup failed twice for $tag"
-  wait_idle
+  wait_idle "$run_dir"
 }
 
 start_sampler() {
@@ -301,7 +474,7 @@ start_sampler() {
   (
     while true; do
       printf '# sample_time_unix_ms %s\n' "$(date +%s%3N)" >>"$output"
-      curl -fsS --max-time 5 "$BASE_URL/metrics" >>"$output" || printf '# scrape_error\n' >>"$output"
+      curl -fsS --max-time 5 "$BASE_URL/metrics" >>"$output" 2>/dev/null || printf '# scrape_error\n' >>"$output"
       printf '\n' >>"$output"
       sleep 1
     done
@@ -311,8 +484,9 @@ start_sampler() {
 
 stop_sampler() {
   if [[ -n "$SAMPLER_PID" ]]; then
-    kill "$SAMPLER_PID" 2>/dev/null || true
-    wait "$SAMPLER_PID" 2>/dev/null || true
+    # Stop the loop before its child; child-first races with the loop spawning
+    # another sleep/curl and can leave wait blocked forever.
+    stop_background "$SAMPLER_PID"
     SAMPLER_PID=""
   fi
 }
@@ -346,7 +520,7 @@ run_attempt() {
   local case_start
   case_start="$(date --iso-8601=seconds)"
 
-  wait_idle
+  wait_idle "$run_dir"
   curl -fsS "$BASE_URL/metrics" >"$before"
   docker inspect "$CONTAINER_NAME" >"$inspect_before"
 
@@ -400,7 +574,7 @@ run_attempt() {
     log "WARNING: samples file missing for $attempt_id"
     : >"$samples"
   fi
-  gzip -f "$samples"
+  gzip -f "$samples" || true
   curl -fsS "$BASE_URL/metrics" >"$after"
   docker logs --timestamps --since "$case_start" "$CONTAINER_NAME" >"$case_serve_log" 2>&1 || true
   docker inspect "$CONTAINER_NAME" >"$inspect_after"
@@ -637,4 +811,6 @@ main() {
   esac
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  main "$@"
+fi

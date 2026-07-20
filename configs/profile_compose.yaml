@@ -1,0 +1,5 @@
+services:
+  qwen3.6-vllm-service:
+    volumes:
+      - ${PROFILE_WRAPPER_HOST}:/workspace/start.sh:ro
+      - ${RUN_DIR_HOST}:/bench_run

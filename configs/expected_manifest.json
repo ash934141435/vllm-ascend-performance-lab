@@ -1,0 +1,83 @@
+{
+  "frozen_at": "2026-07-16T15:05:00+08:00",
+  "frozen_by": "bench_matrix.sh init + manual remote probe (server 60, container qwen3.6-vllm)",
+  "note": "Stage-2 experiment baseline is fixed at max-num-seqs=32 / max-num-batched-tokens=16384. The service observed at freeze time was still running the legacy production config 16/8192; it MUST be restarted to the 32/16384 baseline before any phase-1 candidate re-run or ablation.",
+  "running_service_at_freeze": {
+    "max_num_seqs": 16,
+    "max_num_batched_tokens": 8192,
+    "action_required": "restart_service_to_baseline_32_16384"
+  },
+  "image": {
+    "digest": "sha256:d01163b6517362feba9d4896358952b4c28a4eaf529c98a0d8e95e4c0f2044b7"
+  },
+  "software": {
+    "vllm_version": "0.21.0",
+    "vllm_commit": "ad7125a431e176d4161099480a66f0169609a690",
+    "vllm_ascend_version": "0.21.0rc1",
+    "vllm_ascend_commit": "80610e4438dba05011b05f89fc45d91e96992671",
+    "cann": "9.0.0",
+    "driver": "26.0.rc1",
+    "firmware_inner_version": "V100R001C10SPC001B260",
+    "firmware_package": "26.0.rc1",
+    "torch": "2.10.0+cpu",
+    "torch_npu": "2.10.0",
+    "triton": "3.2.0",
+    "triton_ascend": "3.2.1"
+  },
+  "model": {
+    "served_name": "Qwen3.6-27B",
+    "artifact_path": "/mnt/nvme0/gpustack/cache/model_scope/Eco-Tech/Qwen3.6-27B-w8a8",
+    "architectures": "Qwen3_5ForConditionalGeneration",
+    "quantization": "w8a8",
+    "config_json_sha256": "69db4eb7196bc8190813231b3018ca05d8c2e3abc7b1af19d55c157af44a9d9c",
+    "max_model_len": 65535,
+    "layer_pattern": "3x linear_attention(GatedDeltaNetAttention) + 1x full_attention, repeated 16x (48 DeltaNet + 16 Attention)",
+    "native_mtp": true
+  },
+  "hardware": {
+    "npu": "4x Ascend 910B4-1 (64 GiB HBM each)",
+    "npu_ids": [0, 1, 2, 3],
+    "tensor_parallel_size": 4,
+    "host_numa_nodes": 8,
+    "host_numa_node0_cpus": "0-23"
+  },
+  "experiment_baseline": {
+    "max_num_seqs": 32,
+    "max_num_batched_tokens": 16384,
+    "async_scheduling": true,
+    "mtp": {
+      "enabled": true,
+      "method": "qwen3_5_mtp",
+      "num_speculative_tokens": 3,
+      "enforce_eager": true
+    },
+    "graph_mode": "FULL_DECODE_ONLY",
+    "cpu_binding": true,
+    "gpu_memory_utilization": 0.90
+  },
+  "launch_args": "/usr/local/python3.12.13/bin/python3 /usr/local/python3.12.13/bin/vllm serve /model --host 0.0.0.0 --port 8010 --served-model-name Qwen3.6-27B --tensor-parallel-size 4 --trust-remote-code --gpu-memory-utilization 0.90 --max-model-len 65535 --max-num-seqs 16 --max-num-batched-tokens 8192 --mm-processor-cache-gb 0 --allowed-local-media-path / --async-scheduling --enable-auto-tool-choice --no-enable-prefix-caching --tool-call-parser qwen3_coder --reasoning-parser qwen3 --additional-config {\"enable_cpu_binding\":true} --speculative_config {\"method\": \"qwen3_5_mtp\", \"num_speculative_tokens\": 3, \"enforce_eager\": true} --compilation-config {\"cudagraph_mode\":\"FULL_DECODE_ONLY\"}",
+  "environment_variables": {
+    "ASCEND_RT_VISIBLE_DEVICES": "0,1,2,3",
+    "HCCL_OP_EXPANSION_MODE": "AIV",
+    "HCCL_BUFFSIZE": "512",
+    "OMP_NUM_THREADS": "1",
+    "OMP_PROC_BIND": "false",
+    "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
+    "TASK_QUEUE_ENABLE": "1",
+    "ASCEND_TOOLKIT_HOME": "/usr/local/Ascend/cann-9.0.0",
+    "ASCEND_TOOLKIT_LATEST_HOME": "/usr/local/Ascend/ascend-toolkit/latest",
+    "ASCEND_HOME_PATH": "/usr/local/Ascend/cann-9.0.0",
+    "ASCEND_OPP_PATH": "/usr/local/Ascend/cann-9.0.0/opp",
+    "ASCEND_AICPU_PATH": "/usr/local/Ascend/cann-9.0.0",
+    "ASCEND_DOCKER_RUNTIME": "True"
+  },
+  "process_affinity": {
+    "vllm_pid": 1,
+    "current_affinity": "0-191",
+    "note": "No host-level taskset pin; CPU binding is applied internally via --additional-config enable_cpu_binding:true."
+  },
+  "tooling": {
+    "msprof": "/usr/local/Ascend/cann-9.0.0/bin/msprof",
+    "msprof_available": true
+  }
+}

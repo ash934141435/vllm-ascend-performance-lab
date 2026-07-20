@@ -33,6 +33,18 @@ CASE_RE = re.compile(
     r"r(?P<repeat_id>\d+)"
 )
 
+# Stage-2 ablation case id: encodes the config id (BASE/ASYNC_OFF/MTP_OFF/EAGER)
+# and the fixed-prompt workload geometry. Does NOT depend on the global
+# experiment.yaml matrix (seq/bt are applied via service restart, not case id).
+ABLATION_CASE_RE = re.compile(
+    r"abl_(?P<config>[A-Za-z0-9_]+)_"
+    r"in(?P<input_len>\d+)_"
+    r"out(?P<output_len>\d+)_"
+    r"c(?P<concurrency>\d+)_"
+    r"r(?P<repeat_id>\d+)"
+)
+ABLATION_NUM_PROMPTS = 64
+
 METRIC_RE = re.compile(
     r"^(?P<name>[A-Za-z_:][A-Za-z0-9_:]*)"
     r"(?:\{(?P<labels>[^}]*)\})?\s+"
@@ -74,6 +86,10 @@ EXPECTED_MEDIAN_ROWS = (
 )
 SEQ_RE = re.compile(r"(--max-num-seqs\s+)(\d+)")
 BT_RE = re.compile(r"(--max-num-batched-tokens\s+)(\d+)")
+# Stage-2 ablation toggles (plan §5).
+ASYNC_LINE_RE = re.compile(r"^\s*--async-scheduling\s*\\\n", re.MULTILINE)
+MTP_LINE_RE = re.compile(r"^\s*--speculative_config\s+'[^']*'\s*\\\n", re.MULTILINE)
+GRAPH_RE = re.compile(r'(cudagraph_mode["\s]*[:=]\s*["\']?)(FULL_DECODE_ONLY|NONE)')
 
 RAW_FIELDS = [
     "experiment_config_sha256",
@@ -189,6 +205,15 @@ def parse_case_id(case_id: str) -> dict[str, int]:
     return {key: int(value) for key, value in match.groupdict().items()}
 
 
+def parse_case_id_ablation(case_id: str) -> dict[str, int]:
+    match = ABLATION_CASE_RE.fullmatch(case_id)
+    if not match:
+        raise ValueError(f"invalid ablation case id: {case_id}")
+    parsed = {key: int(value) for key, value in match.groupdict().items() if key != "config"}
+    parsed["config"] = match.group("config")
+    return parsed
+
+
 def parse_labels(raw: Optional[str]) -> dict[str, str]:
     if not raw:
         return {}
@@ -297,22 +322,49 @@ def replace_once(pattern: re.Pattern[str], text: str, value: int) -> str:
 
 def normalize_start_script(text: str) -> str:
     text = SEQ_RE.sub(r"\1<SEQ>", text)
-    return BT_RE.sub(r"\1<BT>", text)
+    text = BT_RE.sub(r"\1<BT>", text)
+    text = ASYNC_LINE_RE.sub("", text)
+    text = MTP_LINE_RE.sub("", text)
+    text = GRAPH_RE.sub(r"\1<GRAPH>", text)
+    return text
 
 
-def render_start_script(source: str, seq: int, bt: int) -> tuple[str, str]:
+def render_start_script(
+    source: str,
+    seq: int,
+    bt: int,
+    disable_async: bool = False,
+    disable_mtp: bool = False,
+    eager: bool = False,
+) -> tuple[str, str]:
     if seq not in VALID_SEQS or bt not in VALID_BT:
         raise ValueError(f"unsupported matrix values: seq={seq} bt={bt}")
     rendered = replace_once(SEQ_RE, source, seq)
     rendered = replace_once(BT_RE, rendered, bt)
+    if disable_async:
+        rendered = ASYNC_LINE_RE.sub("", rendered)
+    if disable_mtp:
+        rendered = MTP_LINE_RE.sub("", rendered)
+    if eager:
+        rendered = GRAPH_RE.sub(r"\1NONE", rendered)
     if normalize_start_script(source) != normalize_start_script(rendered):
         raise ValueError("rendered script changed outside allowed parameters")
+    flags = "".join(
+        f"_{f}"
+        for f, on in (
+            ("noasync", disable_async),
+            ("nomtp", disable_mtp),
+            ("eager", eager),
+        )
+        if on
+    )
+    tofile = f"start_seq{seq}_bt{bt}{flags}.sh"
     diff_text = "".join(
         difflib.unified_diff(
             source.splitlines(keepends=True),
             rendered.splitlines(keepends=True),
             fromfile="start-vllm.original.sh",
-            tofile=f"start_seq{seq}_bt{bt}.sh",
+            tofile=tofile,
         )
     )
     return rendered, diff_text
@@ -351,6 +403,38 @@ def evaluate_attempt(context: AttemptContext) -> tuple[dict[str, object], str, l
     expected_prompts = case["concurrency"] * 5
     expected_input_tokens = case["input_len"] * expected_prompts
     expected_output_tokens = case["output_len"] * expected_prompts
+    return _evaluate_attempt_body(
+        context, case, expected_prompts, expected_input_tokens, expected_output_tokens,
+        EXPERIMENT_CONFIG_SHA256,
+    )
+
+
+def evaluate_attempt_ablation(
+    context: AttemptContext, config_sha: str
+) -> tuple[dict[str, object], str, list[str]]:
+    """Stage-2 variant: case id has no seq/bt; prompts are fixed (ABLATION_NUM_PROMPTS)."""
+    case = parse_case_id_ablation(context.case_id)
+    result = context.result
+    expected_prompts = ABLATION_NUM_PROMPTS
+    expected_input_tokens = case["input_len"] * expected_prompts
+    expected_output_tokens = case["output_len"] * expected_prompts
+    return _evaluate_attempt_body(
+        context, case, expected_prompts, expected_input_tokens, expected_output_tokens,
+        config_sha, input_tol=0.15, delta_tol=0.15,
+    )
+
+
+def _evaluate_attempt_body(
+    context: AttemptContext,
+    case: dict[str, int],
+    expected_prompts: int,
+    expected_input_tokens: int,
+    expected_output_tokens: int,
+    config_sha: str,
+    input_tol: float = 0.0,
+    delta_tol: float = 0.0,
+) -> tuple[dict[str, object], str, list[str]]:
+    result = context.result
 
     queue = histogram_delta(context.before, context.after, "vllm:request_queue_time_seconds")
     prefill = histogram_delta(context.before, context.after, "vllm:request_prefill_time_seconds")
@@ -372,7 +456,13 @@ def evaluate_attempt(context: AttemptContext) -> tuple[dict[str, object], str, l
         hard.append("request_errors")
     if result.get("completed") != expected_prompts:
         hard.append("completed_count")
-    if result.get("input_lens") != [case["input_len"]] * expected_prompts:
+    # input length: stitched real-text prompts are variable; allow tolerance.
+    if input_tol > 0:
+        lo = case["input_len"] * (1.0 - input_tol)
+        hi = case["input_len"] * (1.0 + input_tol)
+        if any(not (lo <= x <= hi) for x in (result.get("input_lens") or [])):
+            hard.append("input_length")
+    elif result.get("input_lens") != [case["input_len"]] * expected_prompts:
         hard.append("input_length")
     if result.get("output_lens") != [case["output_len"]] * expected_prompts:
         hard.append("output_length")
@@ -393,10 +483,16 @@ def evaluate_attempt(context: AttemptContext) -> tuple[dict[str, object], str, l
 
     if request_delta != expected_prompts:
         retryable.append("request_counter_pollution")
-    if prompt_delta != expected_input_tokens:
-        retryable.append("prompt_token_pollution")
-    if generation_delta != expected_output_tokens:
-        retryable.append("generation_token_pollution")
+    if delta_tol > 0:
+        if abs(prompt_delta - expected_input_tokens) > expected_input_tokens * delta_tol:
+            retryable.append("prompt_token_pollution")
+        if abs(generation_delta - expected_output_tokens) > expected_output_tokens * delta_tol:
+            retryable.append("generation_token_pollution")
+    else:
+        if prompt_delta != expected_input_tokens:
+            retryable.append("prompt_token_pollution")
+        if generation_delta != expected_output_tokens:
+            retryable.append("generation_token_pollution")
     if not context.samples or sample_gap(context.samples):
         retryable.append("metrics_sampling_gap")
 
@@ -414,7 +510,7 @@ def evaluate_attempt(context: AttemptContext) -> tuple[dict[str, object], str, l
     reasons = hard if hard else sorted(set(retryable))
 
     row: dict[str, object] = {
-        "experiment_config_sha256": EXPERIMENT_CONFIG_SHA256,
+        "experiment_config_sha256": config_sha,
         **case,
         "num_prompts": expected_prompts,
         "output_throughput_tok_s": result.get("output_throughput"),
@@ -476,6 +572,8 @@ def comparable_rows_for_tail(run_dir: Path, seq: int, bt: int, row: dict[str, ob
     for path in sorted((run_dir / "summary" / "attempts").glob("*.json")):
         candidate = load_json(path)
         if candidate.get("attempt_status") != "valid":
+            continue
+        if not {"max_num_seqs", "max_num_batched_tokens", "input_len", "output_len", "concurrency"} <= candidate.keys():
             continue
         if int(candidate["max_num_seqs"]) != seq or int(candidate["max_num_batched_tokens"]) != bt:
             continue
@@ -897,7 +995,14 @@ def command_render_start(args: argparse.Namespace) -> int:
     source_path = Path(args.source)
     dest_path = Path(args.dest)
     diff_path = Path(args.diff_out)
-    rendered, diff_text = render_start_script(source_path.read_text(), args.seq, args.bt)
+    rendered, diff_text = render_start_script(
+        source_path.read_text(),
+        args.seq,
+        args.bt,
+        disable_async=args.disable_async,
+        disable_mtp=args.disable_mtp,
+        eager=args.eager,
+    )
     dest_path.write_text(rendered)
     dest_path.chmod(0o755)
     diff_path.write_text(diff_text)
@@ -915,6 +1020,28 @@ def command_config_shell(args: argparse.Namespace) -> int:
         "DEFAULT_CONCURRENCIES": " ".join(map(str, config["concurrencies"])),
         "REPEAT_IDS": " ".join(map(str, range(1, int(config["repeats"]) + 1))),
         "EXPERIMENT_CONFIG_SHA256": digest,
+    }
+    for key, value in values.items():
+        print(f"{key}={shlex.quote(str(value))}")
+    return EXIT_VALID
+
+
+def command_config_ablation(args: argparse.Namespace) -> int:
+    import yaml
+
+    cfg = yaml.safe_load(Path(args.config).read_text())
+    baseline = cfg["baseline"]
+    values = {
+        "ABLATION_BASELINE_SEQ": baseline["max_num_seqs"],
+        "ABLATION_BASELINE_BT": baseline["max_num_batched_tokens"],
+        "ABLATION_CONFIG_IDS": " ".join(cfg["configs"].keys()),
+        "ABLATION_MATRIX_JSON": json.dumps(cfg["configs"], sort_keys=True),
+        "ABLATION_WORKLOADS_JSON": json.dumps(cfg["workloads"], sort_keys=True),
+        "ABLATION_ROTATION_JSON": json.dumps(cfg["rotation"], sort_keys=True),
+        "ABLATION_REPEATS": cfg.get("repeats", 3),
+        "ABLATION_TIMEOUT_SECONDS": cfg["perf_workload"]["timeout_seconds"],
+        "ABLATION_RESULTS_DIR": cfg.get("results_dir", "results/execution_ablation"),
+        "ABLATION_CONFIG_SHA256": hashlib.sha256(Path(args.config).read_bytes()).hexdigest(),
     }
     for key, value in values.items():
         print(f"{key}={shlex.quote(str(value))}")
@@ -979,6 +1106,136 @@ def command_attempt(args: argparse.Namespace) -> int:
         return EXIT_HARD
     if row.get("warning_reasons"):
         return EXIT_WARNING
+    return EXIT_VALID
+
+
+def command_attempt_ablation(args: argparse.Namespace) -> int:
+    result_path = Path(args.result_file)
+    before_path = Path(args.metrics_before)
+    after_path = Path(args.metrics_after)
+    samples_path = Path(args.metrics_samples)
+    before_inspect = load_json(Path(args.inspect_before))
+    after_inspect = load_json(Path(args.inspect_after))
+    context = AttemptContext(
+        case_id=args.case_id,
+        result=load_json(result_path),
+        before=parse_prometheus(read_text(before_path)),
+        after=parse_prometheus(read_text(after_path)),
+        samples=parse_samples(samples_path),
+        bench_rc=args.bench_rc,
+        restart_count_before=int(inspect_value(before_inspect, ["RestartCount"], 0)),
+        restart_count_after=int(inspect_value(after_inspect, ["RestartCount"], 0)),
+        started_at_before=str(inspect_value(before_inspect, ["State", "StartedAt"], "")),
+        started_at_after=str(inspect_value(after_inspect, ["State", "StartedAt"], "")),
+        oom_killed=bool(inspect_value(after_inspect, ["State", "OOMKilled"], False)),
+        serve_log=read_text(Path(args.case_serve_log)),
+    )
+    config_sha = args.config_sha or ABLATION_CONFIG_SHA256_PLACEHOLDER
+    row, status, reasons = evaluate_attempt_ablation(context, config_sha)
+    row.update(
+        {
+            "case_id": args.case_id,
+            "attempt_id": args.attempt_id,
+            "attempt_number": args.attempt_number,
+            "result_file": str(result_path),
+            "metrics_file": str(samples_path),
+            "serve_log_file": args.serve_log_file,
+        }
+    )
+    output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(row, indent=2, ensure_ascii=False) + "\n")
+    print(
+        json.dumps(
+            {
+                "status": status,
+                "reasons": reasons,
+                "warning_reasons": row.get("warning_reasons", []),
+            },
+            ensure_ascii=False,
+        )
+    )
+    if status == "retryable":
+        return EXIT_RETRYABLE
+    if status == "hard":
+        return EXIT_HARD
+    if row.get("warning_reasons"):
+        return EXIT_WARNING
+    return EXIT_VALID
+
+
+ABLATION_CONFIG_SHA256_PLACEHOLDER = "UNKNOWN_ABLATION_CONFIG"
+
+ABLATION_RESULT_FIELDS = (
+    "spec_decode_num_drafts",
+    "spec_decode_draft_tokens",
+    "spec_decode_accepted_tokens",
+    "spec_decode_acceptance_rate",
+    "spec_decode_acceptance_length",
+    "spec_decode_per_position_acceptance_rates",
+)
+
+
+def summarize_ablation(run_dir: Path) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    rows = [load_json(path) for path in sorted((run_dir / "summary" / "attempts").glob("abl_*.json"))]
+    for row in rows:
+        result = load_json(Path(str(row["result_file"])))
+        for field_name in ABLATION_RESULT_FIELDS:
+            row[field_name] = result.get(field_name, "N/A")
+
+    groups: dict[tuple[object, ...], list[dict[str, object]]] = {}
+    for row in rows:
+        key = (row["config"], row["input_len"], row["output_len"], row["concurrency"])
+        groups.setdefault(key, []).append(row)
+
+    summaries: list[dict[str, object]] = []
+    numeric_fields = [
+        key for key, value in rows[0].items()
+        if isinstance(value, (int, float)) and not isinstance(value, bool)
+        and key not in {"input_len", "output_len", "concurrency", "repeat_id", "attempt_number"}
+    ] if rows else []
+    for key, group in sorted(groups.items()):
+        summary: dict[str, object] = dict(zip(("config", "input_len", "output_len", "concurrency"), key))
+        summary["repeat_count"] = len(group)
+        summary["complete"] = len(group) == 3 and all(row.get("attempt_status") == "valid" for row in group)
+        for field_name in numeric_fields:
+            values = [float(row[field_name]) for row in group if isinstance(row.get(field_name), (int, float))]
+            summary[field_name] = statistics.median(values) if values else "N/A"
+        summaries.append(summary)
+
+    bases = {
+        (row["input_len"], row["output_len"], row["concurrency"]): row
+        for row in summaries if row["config"] == "BASE"
+    }
+    for summary in summaries:
+        base = bases.get((summary["input_len"], summary["output_len"], summary["concurrency"]))
+        if not base:
+            continue
+        for field_name in numeric_fields:
+            value, baseline = summary.get(field_name), base.get(field_name)
+            if isinstance(value, (int, float)) and isinstance(baseline, (int, float)) and baseline:
+                summary[f"{field_name}_vs_base_pct"] = (value / baseline - 1) * 100
+    return rows, summaries
+
+
+def command_summarize_ablation(args: argparse.Namespace) -> int:
+    run_dir = Path(args.run_dir)
+    rows, summaries = summarize_ablation(run_dir)
+    if not rows:
+        raise ValueError(f"no ablation attempts found in {run_dir}")
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    private_fields = {"result_file", "metrics_file", "serve_log_file"}
+    raw_fields = list(dict.fromkeys(
+        ["config", "input_len", "output_len", "concurrency", "repeat_id", "attempt_status"]
+        + sorted(key for row in rows for key in row if key not in private_fields)
+    ))
+    summary_fields = list(dict.fromkeys(
+        ["config", "input_len", "output_len", "concurrency", "repeat_count", "complete"]
+        + sorted(key for row in summaries for key in row)
+    ))
+    write_csv(output_dir / "raw.csv", rows, raw_fields)
+    write_csv(output_dir / "summary.csv", summaries, summary_fields)
     return EXIT_VALID
 
 
@@ -1120,7 +1377,14 @@ def build_parser() -> argparse.ArgumentParser:
     render.add_argument("--diff-out", required=True)
     render.add_argument("--seq", required=True, type=int)
     render.add_argument("--bt", required=True, type=int)
+    render.add_argument("--disable-async", action="store_true")
+    render.add_argument("--disable-mtp", action="store_true")
+    render.add_argument("--eager", action="store_true")
     render.set_defaults(func=command_render_start)
+
+    abl = subparsers.add_parser("config-ablation")
+    abl.add_argument("--config", required=True)
+    abl.set_defaults(func=command_config_ablation)
 
     attempt = subparsers.add_parser("attempt")
     attempt.add_argument("--case-id", required=True)
@@ -1140,6 +1404,28 @@ def build_parser() -> argparse.ArgumentParser:
     attempt.add_argument("--seq", type=int)
     attempt.add_argument("--bt", type=int)
     attempt.set_defaults(func=command_attempt)
+
+    abl_attempt = subparsers.add_parser("attempt-ablation")
+    abl_attempt.add_argument("--case-id", required=True)
+    abl_attempt.add_argument("--attempt-id", required=True)
+    abl_attempt.add_argument("--attempt-number", required=True, type=int)
+    abl_attempt.add_argument("--result-file", required=True)
+    abl_attempt.add_argument("--metrics-before", required=True)
+    abl_attempt.add_argument("--metrics-after", required=True)
+    abl_attempt.add_argument("--metrics-samples", required=True)
+    abl_attempt.add_argument("--inspect-before", required=True)
+    abl_attempt.add_argument("--inspect-after", required=True)
+    abl_attempt.add_argument("--case-serve-log", required=True)
+    abl_attempt.add_argument("--serve-log-file", required=True)
+    abl_attempt.add_argument("--bench-rc", required=True, type=int)
+    abl_attempt.add_argument("--config-sha", required=True)
+    abl_attempt.add_argument("--output", required=True)
+    abl_attempt.set_defaults(func=command_attempt_ablation)
+
+    abl_summary = subparsers.add_parser("summarize-ablation")
+    abl_summary.add_argument("--run-dir", required=True)
+    abl_summary.add_argument("--output-dir", required=True)
+    abl_summary.set_defaults(func=command_summarize_ablation)
 
     group = subparsers.add_parser("group-review")
     group.add_argument("--run-dir", required=True)

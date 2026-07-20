@@ -1,0 +1,8 @@
+{"prompt":"Answer with only the number. What is 17 + 25?"}
+{"prompt":"Answer with only one lowercase word. What color is a clear daytime sky?"}
+{"prompt":"Return exactly this JSON object with no markdown: {\"ok\":true}"}
+{"prompt":"Output exactly the following two characters and nothing else: 32"}
+{"prompt":"Answer with only the chemical symbol for gold."}
+{"prompt":"Translate 'hello' to Spanish. Output only the translated word."}
+{"prompt":"Answer yes or no only: Is 97 a prime number?"}
+{"prompt":"Output only the sorted comma-separated numbers: 9, 1, 5, 3"}

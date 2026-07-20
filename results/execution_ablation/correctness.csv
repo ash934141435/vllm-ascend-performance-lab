@@ -1,0 +1,9 @@
+request_id,reference_config,candidate_config,exact_token_ids,first_divergence,reference_tokens,candidate_tokens,reference_finish_reason,candidate_finish_reason
+000-a3d307ea4363,BASE,MTP_OFF,False,3,157,113,stop,stop
+001-2f1940f88a3b,BASE,MTP_OFF,True,,6,6,stop,stop
+002-65e6472792b5,BASE,MTP_OFF,True,,10,10,stop,stop
+003-4dd329dc5bf4,BASE,MTP_OFF,False,46,189,189,stop,stop
+004-73426102a1ef,BASE,MTP_OFF,True,,6,6,stop,stop
+005-ead03b492a71,BASE,MTP_OFF,False,40,177,173,stop,stop
+006-8027b1629492,BASE,MTP_OFF,False,50,560,322,stop,stop
+007-1f3b247151b3,BASE,MTP_OFF,False,3,273,955,stop,stop

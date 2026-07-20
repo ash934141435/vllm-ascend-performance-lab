@@ -1,0 +1,79 @@
+# Stage-2 execution-mechanism ablation matrix (plan §5).
+# Single-variable changes from the 32/16384 baseline only.
+# Toggled flags map to vLLM serve args in start-vllm.sh:
+#   disable_async -> drop `--async-scheduling`
+#   disable_mtp   -> drop `--speculative_config '{...}'`
+#   eager         -> cudagraph_mode FULL_DECODE_ONLY -> NONE (keep MTP / cpu-binding)
+
+baseline:
+  max_num_seqs: 32
+  max_num_batched_tokens: 16384
+  async_scheduling: true
+  mtp: true
+  graph_mode: FULL_DECODE_ONLY
+
+configs:
+  BASE:
+    changes: []
+    disable_async: false
+    disable_mtp: false
+    eager: false
+    note: "Full candidate baseline (async on, MTP on, FULL_DECODE_ONLY)."
+  ASYNC_OFF:
+    changes: [async_scheduling]
+    disable_async: true
+    disable_mtp: false
+    eager: false
+    note: "Close async-scheduling; isolate Host/NPU overlap effect."
+  MTP_OFF:
+    changes: [mtp]
+    disable_async: false
+    disable_mtp: true
+    eager: false
+    note: "Drop speculative decoding; measure verify overhead vs gain."
+  EAGER:
+    changes: [graph_mode]
+    disable_async: false
+    disable_mtp: false
+    eager: true
+    note: "Main model eager (cudagraph NONE); measure decode dispatch overhead."
+
+# Workloads: fixed public real-text prompts, identical request order across configs.
+workloads:
+  prefill_heavy:
+    prompt_tokens_approx: 4096
+    output_tokens: 128
+    concurrency: 1
+    primary_metric: prefill_throughput
+    guardrail_metrics: [ttft, tpot, correctness]
+    purpose: "DeltaNet / Attention / FFN and first-token path."
+  decode_heavy:
+    prompt_tokens_approx: 1024
+    output_tokens: 1024
+    concurrency: 32
+    primary_metric: decode_throughput
+    guardrail_metrics: [tpot, ttft, correctness]
+    purpose: "Scheduler, MTP, graph mode and steady decode."
+
+# Fixed performance workload (plan §4.2).
+perf_workload:
+  num_prompts: 64
+  request_mode: closed_loop
+  request_rate: null
+  timeout_seconds: 1800
+  retry_count: 0
+  connection_reuse: true
+  client_host: "<recorded-host>"
+  network_path: localhost
+  ignore_eos: true
+
+repeats: 3
+
+# Rotation order per plan §5 (reduces compile-cache / warmup / drift confounds).
+rotation:
+  repeat1: [BASE, ASYNC_OFF, MTP_OFF, EAGER]
+  repeat2: [MTP_OFF, EAGER, BASE, ASYNC_OFF]
+  repeat3: [EAGER, BASE, ASYNC_OFF, MTP_OFF]
+
+# Expected results layout.
+results_dir: results/execution_ablation

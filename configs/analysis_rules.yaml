@@ -1,0 +1,65 @@
+# Frozen machine decision rules for stage-2 execution-mechanism ablation.
+# baseline_drift thresholds are computed from the 270 historical canonical results,
+# restricted to the candidate config (max-num-seqs=32, max-num-batched-tokens=16384):
+# 30 valid rows across 10 cells (input_len x concurrency), each cell with 3 repeats.
+# Formula per metric: rel = 3 * MAD(median) / |median|, threshold = max(0.05, rel).
+# Computed 2026-07-16; must NOT be changed after runs complete.
+
+baseline_drift:
+  method: historical_median_mad
+  source: results/valid_results.csv#candidate_32_16384
+  computed_from: {valid_rows: 30, cells: 10, repeats_per_cell: 3}
+  # Frozen per-metric max relative deviation (max(0.05, 3*MAD/median)).
+  max_relative_deviation:
+    output_throughput_tok_s: 0.0500
+    request_throughput_req_s: 0.0500
+    mean_ttft_ms: 0.0555
+    p50_ttft_ms: 0.0675
+    p95_ttft_ms: 0.0500
+    p99_ttft_ms: 0.0500
+    mean_tpot_ms: 0.0552
+    p99_tpot_ms: 0.1920
+    mean_itl_ms: 0.0500
+    p99_itl_ms: 0.0500
+    mean_e2el_ms: 0.0519
+    p99_e2el_ms: 0.1938
+    queue_mean_ms: 0.1130
+    prefill_mean_ms: 0.0800
+    decode_mean_ms: 0.0551
+    kv_peak_pct: 0.0500
+
+invalid_run:
+  foreign_process_on_target_npu: true
+  failed_requests_gt: 0
+  service_restart_gt: 0
+  missing_metrics_snapshot: true
+  benchmark_exit_code_ne: 0
+  manifest_mismatch: true
+  host_load_threshold_source: preflight_idle_window
+
+performance_decision:
+  minimum_effect_size_pct: 5
+  maximum_guardrail_regression_pct: 3
+  require_same_direction_runs: 3
+  aggregation: median
+  # Per-config primary / guardrail metrics (plan §6).
+  primary_guardrail:
+    ASYNC_OFF: {primary: decode_throughput, guardrail: [ttft, tpot]}
+    MTP_OFF: {primary: decode_tpot, guardrail: [throughput, correctness]}
+    EAGER: {primary: decode_tpot, guardrail: [throughput, ttft]}
+
+correctness:
+  compare_by_request_id: true
+  exact_token_ids: true
+  capture_first_divergence: true
+
+profiler_bottleneck:
+  minimum_category_share_pct: 30
+  minimum_lead_over_second_pct_points: 5
+  otherwise: mixed
+
+# Negative-control expectations written BEFORE running (plan §6).
+negative_controls:
+  ASYNC_OFF_x_prefill_C1: expected_small_change
+  MTP_OFF_x_prefill: affects_only_short_decode_tail
+  EAGER_x_prefill: base_is_FULL_DECODE_ONLY_so_prefill_expects_no_graph_gain
