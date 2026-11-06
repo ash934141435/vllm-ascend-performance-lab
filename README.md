@@ -207,3 +207,8 @@ python3 scripts/bench_report.py config-ablation --config configs/execution_ablat
 最终链路：`16/8192`（生产 baseline）→ `32/16384`（阶段一，1024/1024、C32 吞吐 +63.4%）→ 保持 async on、MTP=3、`FULL_DECODE_ONLY`（阶段二 final）。结论限于 TP=4、NPU 0–3、突发 concurrency=32；不外推低 QPS 或其他模型。
 
 > 状态：P1–P4 实验完成；49 项本地测试全绿。大型 Profiler 原始报告留在远端，仓库保存脱敏 CSV、图和 SHA256。
+
+## 相关仓库
+
+- 精度评测（Qwen3.8-27B，W8A8 vs BF16，配对检验 + PPL 哨兵）：
+  [vllm-ascend-quant-eval](https://github.com/ash934141435/vllm-ascend-quant-eval)
