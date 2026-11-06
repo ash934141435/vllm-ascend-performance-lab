@@ -212,3 +212,7 @@ python3 scripts/bench_report.py config-ablation --config configs/execution_ablat
 
 - 精度评测（Qwen3.8-27B，W8A8 vs BF16，配对检验 + PPL 哨兵）：
   [vllm-ascend-quant-eval](https://github.com/ash934141435/vllm-ascend-quant-eval)
+
+## 免责声明
+
+本实验为个人研究项目，不包含任何客户数据或公司内部资产；所用模型、数据集与工具均为公开资源，公开版本已移除服务器地址、主机名、内部路径与容器名称。结论仅反映上述特定版本、镜像与硬件组合下的测量结果，不代表任何厂商的官方立场。
