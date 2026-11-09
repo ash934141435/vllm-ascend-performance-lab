@@ -208,17 +208,31 @@ python3 scripts/bench_report.py config-ablation --config configs/execution_ablat
 
 > 状态：P1–P4 实验完成；49 项本地测试全绿。大型 Profiler 原始报告留在远端，仓库保存脱敏 CSV、图和 SHA256。
 
-## 量化 A/B：W8A8 vs BF16 单流与并发（Qwen3.8-27B，910B4 TP=4）
+## 量化 A/B：W8A8 vs BF16（Qwen3.8-27B，910B4 TP=4）
 
-同机 8 卡各 4 卡并跑两实例（服务参数全同，仅差 `--quantization=ascend`），
-T1 矩阵 `in∈{1024,4096} × c∈{1,8,32} × out=512 × 3 次取中位`，36/36 有效：
+同机 8 卡两实例各占 4 卡，服务参数全同（`32/16384`、MTP=3、`FULL_DECODE_ONLY`），唯一差异 `--quantization=ascend`。
+T1 矩阵 `in∈{1024,4096} × c∈{1,8,32} × out=512 × 3 次取中位`，36/36 次有效、0 failed、0 preemption；
+判定沿用阶段二规则（效应量 ≥5% 且 3/3 同向；guardrail 回退 >3% 不推荐）。Δ 为 W8A8 相对 BF16：
 
-- 单流（c=1）BF16 明确更优：吞吐 +18.1%/+9.9%、TPOT −23.6%/−12.3%（均 3/3 同向）；
-- 高并发（c=32）等价（差 <4%）；唯一显著项 `4096/c8` P99 TTFT −60.9%（3/3 同向）；
-- kernel 归因（torch profiler）：W8A8 kernel 总时间 −21%、MatMul 路径 −29%，
-  但非重叠通信 +50% —— quant→QMM→dequant 依赖链破坏计算/通信重叠，算力不是瓶颈。
+| in | c | 输出吞吐 BF16 / W8A8 (tok/s) | 吞吐 Δ | mean TPOT Δ | P99 TTFT Δ |
+|---:|---:|---|---:|---:|---:|
+| 1024 | 1 | 91.87 / 75.21 | **−18.1%** | +23.6% | +6.2% |
+| 1024 | 8 | 393.9 / 379.2 | −3.7% | +3.5% | +18.9%（2/3 同向） |
+| 1024 | 32 | 725.1 / 733.7 | +1.2% | −0.7% | −6.3% |
+| 4096 | 1 | 79.50 / 71.64 | **−9.9%** | +12.3% | +2.4% |
+| 4096 | 8 | 264.6 / 281.1 | +6.2%（2/3） | +6.2%（1/3） | **−60.9%** |
+| 4096 | 32 | 449.3 / 432.5 | −3.7%（1/3） | +1.9%（1/3） | −5.3%（1/3） |
 
-数据与判定：[`results/quant_ab_w8a8_bf16/`](results/quant_ab_w8a8_bf16/README.md)。
+1. 单流（c=1）BF16 明确更优，吞吐与 TPOT 双 guardrail 同向触发——延迟敏感负载不必迁 W8A8。
+2. c=32 等价（差 <4%）；W8A8 唯一稳定优势是 `4096/c8` 尾延迟：P99 TTFT −60.9%、P99 E2EL −23%。
+3. T3 kernel 归因（c=1，torch profiler rank0，见 `profiling_metadata.md`）：W8A8 kernel 总时间 −21%、
+   MatMul 路径 −29%（`DynamicQuant` 仅占 4.5%），但非重叠通信 +50%
+   —— quant→QMM→dequant 依赖链破坏计算/通信重叠，**算力不是瓶颈**；高并发流水打满后差距消失，与 T1 自洽。
+
+数据：[`results/quant_ab/`](results/quant_ab/) —— `summary.csv`（中位数 + 全指标 `_vs_base_pct`，对齐 execution_ablation schema）、
+`raw.csv`（36 次逐 attempt）、T3 见 `op_statistic_*.csv` / `step_trace_*.csv`。
+> 状态：T1/T3 完成。T2（c∈{16,24}、out=1024）、262144 长上下文与贪心 token 一致性（见 quant-eval 仓库）未测；
+> 大型 trace 与原始 profiler 产物留存于采集节点，仓库只入脱敏聚合。
 
 ## 相关仓库
 
