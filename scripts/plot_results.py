@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SUMMARY = ROOT / "results/summary_median.csv"
+SUMMARY = ROOT / "results/stage1_serving/summary_median.csv"
 FIGURES = SUMMARY.parent / "figures"
 COLORS = {16: "#4C78A8", 24: "#F58518", 32: "#54A24B"}
 

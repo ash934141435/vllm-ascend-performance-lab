@@ -7,7 +7,7 @@
 
 baseline_drift:
   method: historical_median_mad
-  source: results/valid_results.csv#candidate_32_16384
+  source: results/stage1_serving/valid_results.csv#candidate_32_16384
   computed_from: {valid_rows: 30, cells: 10, repeats_per_cell: 3}
   # Frozen per-metric max relative deviation (max(0.05, 3*MAD/median)).
   max_relative_deviation:

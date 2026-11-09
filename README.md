@@ -11,9 +11,11 @@
 
 脚本会采集运行环境，生成服务配置并重启 vLLM，完成预热后重复测试，同时记录运行指标。异常结果会自动复测，最后统一生成 CSV、XLSX、Markdown 报告和图表。目前仓库归档了 9 组服务配置、90 个测试场景和 270 条 canonical 结果。
 
+## 实验一：Qwen3.6-27B 高并发 Serving 参数调优（阶段一）
+
 生产 Baseline 是 `max-num-seqs=16`、`max-num-batched-tokens=8192`。这批数据里最明显的问题不是 KV cache 不够，而是 `max-num-seqs` 小于实际并发，很多请求只能排队。
 
-## 实验环境（阶段一/二，Qwen3.6-27B）
+## 实验一/二共用环境（Qwen3.6-27B · vLLM 0.21.0 · CANN 9.0.0）
 
 这些信息来自测试初始化时保存的环境快照。公开版本已经去掉服务器地址、主机名、内部路径和容器名称。
 
@@ -66,31 +68,31 @@
 
 ### 1. 吞吐随并发变化
 
-![吞吐随并发变化](results/figures/throughput_by_concurrency.png)
+![吞吐随并发变化](results/stage1_serving/figures/throughput_by_concurrency.png)
 
 并发不超过 16 时，三种 `max-num-seqs` 差别不大。并发升到 32 后，`max-num-seqs=16` 的吞吐开始回落，`max-num-seqs=32` 仍能继续上升。
 
 ### 2. 首 Token 延迟随并发变化
 
-![TTFT 随并发变化](results/figures/ttft_by_concurrency.png)
+![TTFT 随并发变化](results/stage1_serving/figures/ttft_by_concurrency.png)
 
 把 `max-num-seqs` 提到 32 可以解决排队，但解决不了所有延迟问题。长输入下的 P95/P99 TTFT 仍会明显增长。
 
 ### 3. 单 Token 延迟
 
-![TPOT 随并发变化](results/figures/tpot_by_concurrency.png)
+![TPOT 随并发变化](results/stage1_serving/figures/tpot_by_concurrency.png)
 
 并发越高，总吞吐通常越高，但单个请求生成一个 Token 所需的时间也在增加。TPOT 可以看出这笔交换什么时候开始不划算。
 
 ### 4. 排队与调度上限
 
-![排队与 max-num-seqs 的关系](results/figures/queue_and_waiting.png)
+![排队与 max-num-seqs 的关系](results/stage1_serving/figures/queue_and_waiting.png)
 
 32 并发下，把 `max-num-seqs` 从 16 提到 32 后，平均排队时间大幅下降。`waiting_peak` 容易受瞬时采样影响，单独看它很容易误判，需要和 queue mean、TTFT 放在一起判断。
 
 补充视图：
 
-![吞吐与 P99 TTFT Pareto 前沿](results/figures/throughput_p99_pareto.png)
+![吞吐与 P99 TTFT Pareto 前沿](results/stage1_serving/figures/throughput_p99_pareto.png)
 
 ## 我从结果里看到什么
 
@@ -158,11 +160,11 @@ python3 scripts/plot_results.py
 结果入口：
 
 - [实验矩阵配置](configs/experiment.yaml)；每条结果均保存该文件的 SHA256，防止混合不同配置的结果。
-- [90 行中位数汇总](results/summary_median.csv)
-- [270 条脱敏 canonical 结果](results/valid_results.csv)
-- [可视化图表](results/figures/)
+- [90 行中位数汇总](results/stage1_serving/summary_median.csv)
+- [270 条脱敏 canonical 结果](results/stage1_serving/valid_results.csv)
+- [可视化图表](results/stage1_serving/figures/)
 
-## 阶段二：执行机制消融与 Profiling
+## 实验二：Qwen3.6-27B 执行机制消融与 Profiling（阶段二）
 
 阶段二在固定 `32/16384` 基线上，对三类执行机制做单变量消融，覆盖两种工作负载（prefill-heavy ≈4096 tok / decode-heavy ≈1024 tok），每种配置重复 3 次，共 24 个结果。
 
@@ -209,7 +211,7 @@ python3 scripts/bench_report.py config-ablation --config configs/execution_ablat
 
 > 状态：P1–P4 实验完成；49 项本地测试全绿。大型 Profiler 原始报告留在远端，仓库保存脱敏 CSV、图和 SHA256。
 
-## 量化 A/B：W8A8 vs BF16（Qwen3.8-27B，910B4 TP=4）
+## 实验三：Qwen3.8-27B 量化 A/B —— W8A8 vs BF16（910B4 TP=4）
 
 同机 8 卡两实例各占 4 卡，服务参数全同（`32/16384`、MTP=3、`FULL_DECODE_ONLY`），唯一差异 `--quantization=ascend`。
 软件栈：vLLM 0.23.0 + vllm-ascend（modelslim W8A8 路径）、CANN 8.3.RC2、driver 26.0.rc1、Python 3.12.13——
@@ -234,6 +236,8 @@ T1 矩阵 `in∈{1024,4096} × c∈{1,8,32} × out=512 × 3 次取中位`，36/3
 
 数据：[`results/quant_ab/`](results/quant_ab/) —— `summary.csv`（中位数 + 全指标 `_vs_base_pct`，对齐 execution_ablation schema）、
 `raw.csv`（36 次逐 attempt）、T3 见 `op_statistic_*.csv` / `step_trace_*.csv`。
+复现：[`scripts/quant_ab/bench_ab_quant.sh`](scripts/quant_ab/bench_ab_quant.sh)（双实例端点经环境变量注入，见脚本头注释）
++ `summarize_ab.py <OUT>`；判定与门控逻辑内嵌于脚本。
 > 状态：T1/T3 完成。T2（c∈{16,24}、out=1024）、262144 长上下文与贪心 token 一致性（见 quant-eval 仓库）未测；
 > 大型 trace 与原始 profiler 产物留存于采集节点，仓库只入脱敏聚合。
 
