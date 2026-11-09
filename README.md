@@ -208,6 +208,18 @@ python3 scripts/bench_report.py config-ablation --config configs/execution_ablat
 
 > 状态：P1–P4 实验完成；49 项本地测试全绿。大型 Profiler 原始报告留在远端，仓库保存脱敏 CSV、图和 SHA256。
 
+## 量化 A/B：W8A8 vs BF16 单流与并发（Qwen3.8-27B，910B4 TP=4）
+
+同机 8 卡各 4 卡并跑两实例（服务参数全同，仅差 `--quantization=ascend`），
+T1 矩阵 `in∈{1024,4096} × c∈{1,8,32} × out=512 × 3 次取中位`，36/36 有效：
+
+- 单流（c=1）BF16 明确更优：吞吐 +18.1%/+9.9%、TPOT −23.6%/−12.3%（均 3/3 同向）；
+- 高并发（c=32）等价（差 <4%）；唯一显著项 `4096/c8` P99 TTFT −60.9%（3/3 同向）；
+- kernel 归因（torch profiler）：W8A8 kernel 总时间 −21%、MatMul 路径 −29%，
+  但非重叠通信 +50% —— quant→QMM→dequant 依赖链破坏计算/通信重叠，算力不是瓶颈。
+
+数据与判定：[`results/quant_ab_w8a8_bf16/`](results/quant_ab_w8a8_bf16/README.md)。
+
 ## 相关仓库
 
 - 精度评测（Qwen3.8-27B，W8A8 vs BF16，配对检验 + PPL 哨兵）：
