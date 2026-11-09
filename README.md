@@ -1,10 +1,11 @@
-# Qwen3.6-27B vLLM-Ascend Serving 与执行机制性能优化
+# vLLM-Ascend 性能实验记录：服务调优、执行机制与量化 A/B（Ascend 910B4）
 
-> 本项目分两个阶段：
-> - **阶段一（已完成）**：高并发 Serving 参数调优 —— `max-num-seqs` / `max-num-batched-tokens` 扫描，得到 `32/16384` 候选配置。
-> - **阶段二（已完成）**：在固定 `32/16384` 基线上完成执行机制消融与 CPU/NPU Profiler；最终保留 async、MTP=3 和 `FULL_DECODE_ONLY`。
+> 本仓库包含三块工作，硬件同为 910B4 但软件栈版本不同，**结论只在各自小节的环境内成立，互不外推**：
+> - **阶段一（已完成，Qwen3.6-27B，vLLM 0.21.0 / CANN 9.0.0）**：高并发 Serving 参数调优 —— `max-num-seqs` / `max-num-batched-tokens` 扫描，得到 `32/16384` 候选配置。
+> - **阶段二（已完成，同上环境）**：在固定 `32/16384` 基线上完成执行机制消融与 CPU/NPU Profiler；最终保留 async、MTP=3 和 `FULL_DECODE_ONLY`。
+> - **量化 A/B（已完成，Qwen3.8-27B，vLLM 0.23.0 / CANN 8.3.RC2）**：同机 W8A8 vs BF16 各 4 卡对比，单流 BF16 更优、高并发等价、差异源于通信暴露；见 [`results/quant_ab/`](results/quant_ab/)。
 >
-> 完整计划见 [`PROJECT_PLAN.md`](PROJECT_PLAN.md)。
+> 阶段一/二完整计划见 [`PROJECT_PLAN.md`](PROJECT_PLAN.md)。
 
 这是我在 Ascend NPU 上调优 vLLM 的实验记录，也是一套可以重复运行的 benchmark 脚本。阶段一主要回答：`max-num-seqs`、`max-num-batched-tokens`、输入长度和并发变化后，吞吐、TTFT、TPOT 与排队时间会怎么变。阶段二在阶段一得到的候选配置上，进一步回答框架执行机制（异步调度、投机解码、图模式）对吞吐与延迟的贡献，以及瓶颈在哪里。
 
@@ -12,7 +13,7 @@
 
 生产 Baseline 是 `max-num-seqs=16`、`max-num-batched-tokens=8192`。这批数据里最明显的问题不是 KV cache 不够，而是 `max-num-seqs` 小于实际并发，很多请求只能排队。
 
-## 实验环境
+## 实验环境（阶段一/二，Qwen3.6-27B）
 
 这些信息来自测试初始化时保存的环境快照。公开版本已经去掉服务器地址、主机名、内部路径和容器名称。
 
@@ -211,6 +212,8 @@ python3 scripts/bench_report.py config-ablation --config configs/execution_ablat
 ## 量化 A/B：W8A8 vs BF16（Qwen3.8-27B，910B4 TP=4）
 
 同机 8 卡两实例各占 4 卡，服务参数全同（`32/16384`、MTP=3、`FULL_DECODE_ONLY`），唯一差异 `--quantization=ascend`。
+软件栈：vLLM 0.23.0 + vllm-ascend（modelslim W8A8 路径）、CANN 8.3.RC2、driver 26.0.rc1、Python 3.12.13——
+注意与阶段一/二（vLLM 0.21.0 / CANN 9.0.0）**不同版本，两组结论不可交叉引用**。
 T1 矩阵 `in∈{1024,4096} × c∈{1,8,32} × out=512 × 3 次取中位`，36/36 次有效、0 failed、0 preemption；
 判定沿用阶段二规则（效应量 ≥5% 且 3/3 同向；guardrail 回退 >3% 不推荐）。Δ 为 W8A8 相对 BF16：
 
